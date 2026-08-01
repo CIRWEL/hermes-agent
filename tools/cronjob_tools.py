@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
-    claim_job_for_fire,
+    claim_job_for_fire_token,
+    create_job,
     effective_job_state,
     get_job,
     is_job_runnable,
@@ -47,6 +48,7 @@ from cron.jobs import (
     mark_job_run,
     parse_schedule,
     pause_job,
+    release_fire_claim,
     remove_job,
     resolve_job_ref,
     resume_job,
@@ -616,9 +618,11 @@ def _execute_job_now(
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    claim_id: Optional[str] = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        claim_id = claim_job_for_fire_token(job_id)
+        if claim_id is None:
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
@@ -639,11 +643,15 @@ def _execute_job_now(
             pass
         return {"claimed": True, "success": False, "error": str(e)}
 
-    return _run_claimed_job(job, extra_prompt=extra_prompt)
+    return _run_claimed_job(
+        job,
+        claim_id=claim_id,
+        extra_prompt=extra_prompt,
+    )
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any], *, claim_id: str, extra_prompt: Optional[str] = None
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -671,6 +679,7 @@ def _run_claimed_job(
         # makes this run visible to the gateway shutdown drain
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
         if not try_register_running_job(job_id):
+            release_fire_claim(job_id, expected_claim_id=claim_id)
             return {
                 "claimed": True,
                 "success": False,
@@ -680,6 +689,18 @@ def _run_claimed_job(
                 ),
             }
         _registered = True
+
+        claimed_job = get_job(job["id"])
+        if not claimed_job:
+            release_fire_claim(job["id"], expected_claim_id=claim_id)
+            release_running_job(job_id)
+            _registered = False
+            return {
+                "claimed": True,
+                "success": False,
+                "error": "Job disappeared after its fire was claimed.",
+            }
+        claimed_job["_fire_claim_id"] = claim_id
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -758,7 +779,9 @@ def _run_claimed_job(
         try:
             try:
                 processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
+                    claimed_job,
+                    adapters=adapters,
+                    loop=gateway_loop,
                     extra_prompt=extra_prompt,
                 )
             finally:
@@ -790,10 +813,19 @@ def _run_claimed_job(
             except Exception:
                 pass
         try:
-            mark_job_run(job_id, False, str(e))
+            mark_job_run(
+                job_id,
+                False,
+                str(e),
+                expected_fire_claim_id=claim_id,
+            )
         except Exception:
             pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {
+            "claimed": True,
+            "success": False,
+            "error": str(e),
+        }
 
 
 def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
@@ -914,7 +946,8 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
-        if not claim_job_for_fire(job_id):
+        claim_id = claim_job_for_fire_token(job_id)
+        if claim_id is None:
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
@@ -951,7 +984,11 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            job,
+            claim_id=claim_id,
+            extra_prompt=extra_prompt,
+        )
         result["dispatched"] = False
         return result
 
@@ -966,7 +1003,11 @@ def _try_dispatch_background_run(
     deliver = job.get("deliver", "local")
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(
+            job,
+            claim_id=claim_id,
+            extra_prompt=extra_prompt,
+        )
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1024,7 +1065,11 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(
+        job,
+        claim_id=claim_id,
+        extra_prompt=extra_prompt,
+    )
     result["dispatched"] = False
     return result
 

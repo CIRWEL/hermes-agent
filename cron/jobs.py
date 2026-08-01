@@ -7,6 +7,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 
 import contextlib
 import copy
+import hashlib
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
@@ -39,6 +40,14 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from cron.runtime_state import (
+    clear_pending_definitions,
+    load_pending_definitions,
+    load_runtime_states,
+    merge_legacy_runtime_states,
+    replace_runtime_states,
+    stage_runtime_and_definitions,
+)
 from utils import atomic_replace, atomic_write_text
 
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
@@ -262,33 +271,38 @@ def _job_running_in_this_process(job_id: str) -> bool:
         return True
 
 
+def current_cron_store_home() -> Path:
+    """Return the active profile home for subprocess-safe cron execution."""
+    return _current_cron_store().cron_dir.parent
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+class _JobsLockUnavailableError(RuntimeError):
+    """Raised when a fail-closed cron store lock cannot be acquired."""
+
+
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, strict: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
-    Combines the in-process threading lock (cheap mutual exclusion between
-    the gateway's parallel tick threads) with a cross-process advisory file
-    lock on ``<cron dir>/.jobs.lock`` (mutual exclusion between the gateway process
-    and standalone ``hermes`` CLI invocations, which previously shared no lock
-    at all — a `cron pause` could be silently clobbered by a concurrent
-    gateway write, leaving a "paused" job still firing).
+    Normal scheduler mutations degrade to the process-local lock after a bounded
+    advisory-lock wait so a wedged peer cannot freeze every cron operation.
+    Coherent multi-file operations such as backup/restore pass ``strict=True``
+    and fail closed instead of reading or writing a torn definition/runtime pair.
 
-    The flock is blocking, but every critical section that uses it is short
-    (field updates only — no agent execution), so contention resolves in
-    milliseconds. If neither fcntl nor msvcrt is available the manager still
-    provides in-process locking, matching the historical behaviour.
-
-    Nested calls in the same thread reuse the held lock so legacy callers that
-    invoke save_jobs() inside a broader mutation section don't deadlock or try
-    to reacquire the advisory file lock.
+    Nested calls in the same thread reuse the held lock. A nested strict caller
+    is rejected if its outer caller already entered degraded mode.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if strict and not getattr(_jobs_lock_state, "cross_process_locked", False):
+            raise _JobsLockUnavailableError(
+                "Cron jobs lock is only held in process-local degraded mode"
+            )
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -304,72 +318,109 @@ def _jobs_lock():
         # section read it. Reset on entry/exit so stale stamps from unlocked
         # loads or prior sections can never suppress a needed merge.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.cross_process_locked = False
         lock_fd = None
+        cross_process_locked = False
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
+                deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
                 if fcntl is not None:
-                    # Bounded acquisition (#60703): a plain blocking
-                    # fcntl.flock(LOCK_EX) here has NO timeout, and it is
-                    # taken while holding the process-wide _jobs_file_lock
-                    # RLock above.  If another process wedges while holding
-                    # .jobs.lock (e.g. an old gateway draining through a
-                    # restart), a single blocked acquirer freezes EVERY cron
-                    # function in this process — including the ticker's
-                    # get_due_jobs() — silently and forever: the heartbeat
-                    # file stops updating and all jobs stop firing with no
-                    # error logged.  Poll LOCK_NB against a deadline instead;
-                    # on timeout, log loudly and fall through to the same
-                    # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
-                    _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            cross_process_locked = True
                             break
-                        except (OSError, IOError):
-                            if time.monotonic() >= _deadline:
-                                logger.error(
-                                    "Timed out after %.0fs waiting for the cron "
-                                    "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
-                                    _JOBS_LOCK_TIMEOUT_SECONDS,
-                                    _jobs_lock_file(),
+                        except (OSError, IOError) as exc:
+                            if time.monotonic() >= deadline:
+                                message = (
+                                    f"Timed out after {_JOBS_LOCK_TIMEOUT_SECONDS:.0f}s "
+                                    f"waiting for cron jobs lock {_jobs_lock_file()}"
                                 )
-                                try:
-                                    lock_fd.close()
-                                except OSError:
-                                    pass
+                                lock_fd.close()
                                 lock_fd = None
+                                if strict:
+                                    raise _JobsLockUnavailableError(message) from exc
+                                logger.error(
+                                    "%s; proceeding with process-local locking only "
+                                    "so the scheduler stays alive (#60703).",
+                                    message,
+                                )
                                 break
                             time.sleep(0.1)
                 elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
-            except (OSError, IOError) as e:
-                # Never let a locking failure take down cron writes — fall back to
-                # in-process-only protection (still held via _jobs_file_lock).
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
-            try:
-                yield
-            finally:
+                    nonblocking = getattr(msvcrt, "LK_NBLCK", None)
+                    if nonblocking is None:
+                        raise OSError("non-blocking msvcrt locking is unavailable")
+                    while True:
+                        try:
+                            lock_fd.seek(0)
+                            getattr(msvcrt, "locking")(lock_fd.fileno(), nonblocking, 1)
+                            cross_process_locked = True
+                            break
+                        except (OSError, IOError) as exc:
+                            if time.monotonic() >= deadline:
+                                message = (
+                                    f"Timed out after {_JOBS_LOCK_TIMEOUT_SECONDS:.0f}s "
+                                    f"waiting for cron jobs lock {_jobs_lock_file()}"
+                                )
+                                lock_fd.close()
+                                lock_fd = None
+                                if strict:
+                                    raise _JobsLockUnavailableError(message) from exc
+                                logger.error(
+                                    "%s; proceeding with process-local locking only "
+                                    "so the scheduler stays alive (#60703).",
+                                    message,
+                                )
+                                break
+                            time.sleep(0.1)
+                elif strict:
+                    lock_fd.close()
+                    lock_fd = None
+                    raise _JobsLockUnavailableError(
+                        "Cross-process cron jobs locking is unavailable"
+                    )
+            except _JobsLockUnavailableError:
+                raise
+            except (OSError, IOError) as exc:
                 if lock_fd is not None:
                     try:
-                        if fcntl is not None:
-                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                        elif msvcrt is not None:
-                            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-                    except (OSError, IOError):
-                        pass
-                    finally:
                         lock_fd.close()
+                    except OSError:
+                        pass
+                    lock_fd = None
+                if strict:
+                    raise _JobsLockUnavailableError(
+                        f"Cron jobs cross-process lock unavailable: {exc}"
+                    ) from exc
+                logger.warning(
+                    "jobs.json cross-process lock unavailable (%s); proceeding "
+                    "with process-local lock only",
+                    exc,
+                )
+
+            _jobs_lock_state.cross_process_locked = cross_process_locked
+            yield
         finally:
+            if lock_fd is not None:
+                try:
+                    if cross_process_locked and fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    elif cross_process_locked and msvcrt is not None:
+                        lock_fd.seek(0)
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                        )
+                except (OSError, IOError):
+                    pass
+                finally:
+                    lock_fd.close()
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process_locked = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -1075,8 +1126,90 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
         return json.loads(raw, strict=False), True
 
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+_RUNTIME_JOB_FIELDS = frozenset({
+    "created_at",
+    "fire_claim",
+    "last_delivery_error",
+    "last_error",
+    "last_run_at",
+    "last_status",
+    "model_snapshot",
+    "next_run_at",
+    "paused_at",
+    "paused_reason",
+    "preflight_alerted",
+    "provider_snapshot",
+    "run_claim",
+    "state",
+    "runtime_tombstone",
+    "monitor_state",
+})
+_EPHEMERAL_JOB_FIELDS = frozenset({"execution_id", "latest_execution"})
+_RUNTIME_REPEAT_COMPLETED = "repeat_completed"
+_RUNTIME_DEFINITION_DIGEST = "_definition_digest"
+_RUNTIME_SCHEDULE_DIGEST = "_schedule_digest"
+
+
+def _canonical_digest(value: Any) -> str:
+    """Return a stable digest for one JSON-compatible definition fragment."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _definition_digests(definition: Dict[str, Any]) -> Tuple[str, str]:
+    """Return full and cadence-sensitive digests for one definition."""
+    cadence = {
+        "enabled": definition.get("enabled", True),
+        "repeat_times": (
+            definition.get("repeat", {}).get("times")
+            if isinstance(definition.get("repeat"), dict)
+            else None
+        ),
+        "schedule": definition.get("schedule"),
+    }
+    return _canonical_digest(definition), _canonical_digest(cadence)
+
+
+def _reconcile_runtime_state(
+    definition: Dict[str, Any],
+    state: Dict[str, Any],
+    *,
+    provided_fields: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Bind runtime to its definition and reset stale cadence/terminal state."""
+    reconciled = copy.deepcopy(state)
+    definition_digest, schedule_digest = _definition_digests(definition)
+    prior_definition_digest = reconciled.get(_RUNTIME_DEFINITION_DIGEST)
+    prior_schedule_digest = reconciled.get(_RUNTIME_SCHEDULE_DIGEST)
+
+    if prior_schedule_digest and prior_schedule_digest != schedule_digest:
+        supplied = provided_fields or set()
+        if "next_run_at" not in supplied:
+            reconciled.pop("next_run_at", None)
+        reconciled[_RUNTIME_REPEAT_COMPLETED] = 0
+        reconciled["fire_claim"] = None
+        reconciled["run_claim"] = None
+        reconciled["state"] = (
+            "scheduled" if definition.get("enabled", True) else "paused"
+        )
+        reconciled.pop("runtime_tombstone", None)
+    elif prior_definition_digest and prior_definition_digest != definition_digest:
+        # Any operator edit revives a runtime-tombstoned declaration. Cadence
+        # and history remain intact unless the cadence digest changed above.
+        reconciled.pop("runtime_tombstone", None)
+
+    reconciled[_RUNTIME_DEFINITION_DIGEST] = definition_digest
+    reconciled[_RUNTIME_SCHEDULE_DIGEST] = schedule_digest
+    return reconciled
+
+
+def _read_job_payload_unlocked() -> Tuple[List[Dict[str, Any]], bool]:
+    """Read the definition artifact and report whether its shape needs repair."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Stamp BEFORE reading (fail-safe direction — see _record_load_stamp):
@@ -1085,7 +1218,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
         _record_load_stamp(None)
-        return []
+        return [], False
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
@@ -1102,20 +1235,16 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+        if not isinstance(jobs, list):
+            raise RuntimeError(
+                "Cron database corrupted: expected {'jobs': [...]}, "
+                f"got jobs={type(jobs).__name__}"
+            )
         _record_load_stamp(pre_read_stamp)
-        return jobs
+        return jobs, _strict_retry
     if isinstance(data, list):
-        # Bare array — likely saved/edited outside save_jobs(). Wrap it back
-        # into the expected {"jobs": [...]} structure.
-        if data:
-            save_jobs(data)
-            logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         _record_load_stamp(pre_read_stamp)
-        return data
+        return data, True
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
@@ -1246,18 +1375,73 @@ def _merge_unexpected_disk_jobs(
     return jobs + recovered
 
 
-def _save_jobs_unlocked(
+def _partition_job_record(
+    job: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split one compatibility job dict into definition and runtime records."""
+    definition = copy.deepcopy(job)
+    runtime: Dict[str, Any] = {}
+
+    # An id-less legacy record cannot be keyed safely in runtime.db. Leave it
+    # combined until the existing due-scan repair assigns an id and saves it.
+    if not definition.get("id"):
+        return definition, runtime
+
+    for field in _RUNTIME_JOB_FIELDS:
+        if field in definition:
+            runtime[field] = definition.pop(field)
+    for field in _EPHEMERAL_JOB_FIELDS:
+        definition.pop(field, None)
+
+    repeat = definition.get("repeat")
+    if isinstance(repeat, dict) and "completed" in repeat:
+        repeat_copy = dict(repeat)
+        runtime[_RUNTIME_REPEAT_COMPLETED] = repeat_copy.pop("completed")
+        definition["repeat"] = repeat_copy
+
+    return definition, runtime
+
+
+def _partition_job_records(
     jobs: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Partition a complete compatibility snapshot by job id."""
+    definitions: List[Dict[str, Any]] = []
+    runtime_states: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        definition, runtime = _partition_job_record(job)
+        definitions.append(definition)
+        job_id = definition.get("id")
+        if job_id and runtime:
+            runtime_states[str(job_id)] = runtime
+    return definitions, runtime_states
+
+
+def _merge_job_record(
+    definition: Dict[str, Any], runtime: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Overlay volatile state onto one definition for compatibility callers."""
+    merged = copy.deepcopy(definition)
+    if not runtime:
+        return merged
+    state = copy.deepcopy(runtime)
+    state.pop(_RUNTIME_DEFINITION_DIGEST, None)
+    state.pop(_RUNTIME_SCHEDULE_DIGEST, None)
+    completed = state.pop(_RUNTIME_REPEAT_COMPLETED, None)
+    merged.update(state)
+    if completed is not None and isinstance(merged.get("repeat"), dict):
+        merged["repeat"] = {**merged["repeat"], "completed": completed}
+    return merged
+
+
+def _write_job_definitions_unlocked(
+    definitions: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
-):
-    """Save all jobs to storage. Caller must hold _jobs_lock().
-
-    ``removed_ids`` lists job ids this mutation intentionally deleted.
-    ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
-    that mean to rewrite the store wholesale).
-    """
+) -> None:
+    """Atomically write only declarative records. Caller holds _jobs_lock()."""
+    jobs = definitions
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1380,16 +1564,149 @@ def _save_jobs_unlocked(
         raise
 
 
+def _recover_pending_definitions_unlocked() -> None:
+    """Finish a journaled cross-store definition write, if one exists."""
+    cron_dir = _current_cron_store().cron_dir
+    pending = load_pending_definitions(cron_dir)
+    if pending is None:
+        return
+    _write_job_definitions_unlocked(pending)
+    clear_pending_definitions(cron_dir)
+
+
+def load_jobs() -> List[Dict[str, Any]]:
+    """Load declarations overlaid with profile-local volatile runtime state.
+
+    Legacy combined stores migrate runtime-first. Journaled ordinary writes are
+    completed before either store is read, so every caller sees one generation.
+    Runtime tombstones remain in this internal compatibility view; public lookup
+    and list surfaces filter them while later saves retain their declarations.
+    """
+    with _jobs_lock():
+        _recover_pending_definitions_unlocked()
+        cron_dir = _current_cron_store().cron_dir
+        jobs_file = _current_cron_store().jobs_file
+        if not jobs_file.exists():
+            existing_runtime = load_runtime_states(cron_dir)
+            if existing_runtime:
+                raise RuntimeError(
+                    "Cron jobs.json is missing while runtime.db still contains "
+                    "job state; refusing to erase runtime during a transient "
+                    "definition replacement. Restore or recover jobs.json."
+                )
+        raw_jobs, needs_rewrite = _read_job_payload_unlocked()
+        definitions, legacy_runtime = _partition_job_records(raw_jobs)
+        if legacy_runtime:
+            merge_legacy_runtime_states(cron_dir, legacy_runtime)
+        if needs_rewrite or legacy_runtime:
+            _write_job_definitions_unlocked(definitions)
+            if needs_rewrite:
+                logger.warning("Auto-repaired jobs.json definition artifact")
+
+        runtime_states = load_runtime_states(cron_dir)
+        reconciled_states: Dict[str, Dict[str, Any]] = {}
+        for definition in definitions:
+            job_id = str(definition.get("id") or "")
+            if not job_id:
+                continue
+            reconciled_states[job_id] = _reconcile_runtime_state(
+                definition,
+                runtime_states.get(job_id, {}),
+            )
+        if reconciled_states != runtime_states:
+            replace_runtime_states(cron_dir, reconciled_states)
+
+        return [
+            _merge_job_record(
+                definition,
+                reconciled_states.get(str(definition.get("id") or "")),
+            )
+            for definition in definitions
+        ]
+
+
+def export_job_definitions() -> List[Dict[str, Any]]:
+    """Return stable operator intent, including runtime-completed declarations."""
+    with _jobs_lock():
+        # Trigger migration/recovery, then read declarations directly so a
+        # runtime-tombstoned one-shot remains reproducible in source control.
+        load_jobs()
+        raw_jobs, _needs_rewrite = _read_job_payload_unlocked()
+        definitions, _runtime = _partition_job_records(raw_jobs)
+        return copy.deepcopy(definitions)
+
+
+def _save_jobs_unlocked(
+    jobs: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Collection[str]] = None,
+    replace: bool = False,
+) -> None:
+    """Persist definitions and runtime separately. Caller holds _jobs_lock()."""
+    _recover_pending_definitions_unlocked()
+    definitions, supplied_runtime = _partition_job_records(jobs)
+    if not replace:
+        definitions = _merge_unexpected_disk_jobs(
+            definitions,
+            removed_ids=removed_ids,
+        )
+    cron_dir = _current_cron_store().cron_dir
+    existing_runtime = load_runtime_states(cron_dir)
+    reconciled_states: Dict[str, Dict[str, Any]] = {}
+
+    for definition in definitions:
+        job_id = str(definition.get("id") or "")
+        if not job_id:
+            continue
+        provided = supplied_runtime.get(job_id)
+        if provided is None:
+            candidate = existing_runtime.get(job_id, {})
+            supplied_fields: Set[str] = set()
+        else:
+            candidate = {
+                key: value
+                for key, value in existing_runtime.get(job_id, {}).items()
+                if key in {_RUNTIME_DEFINITION_DIGEST, _RUNTIME_SCHEDULE_DIGEST}
+            }
+            candidate.update(provided)
+            supplied_fields = set(provided)
+        reconciled_states[job_id] = _reconcile_runtime_state(
+            definition,
+            candidate,
+            provided_fields=supplied_fields,
+        )
+
+    current, needs_rewrite = _read_job_payload_unlocked()
+    current_definitions, legacy_runtime = _partition_job_records(current)
+    definition_changed = bool(
+        needs_rewrite or legacy_runtime or current_definitions != definitions
+    )
+    if not definition_changed:
+        replace_runtime_states(cron_dir, reconciled_states)
+        return
+
+    # Runtime and the desired definitions commit together in SQLite first. The
+    # next load can finish an interrupted jobs.json materialization idempotently.
+    stage_runtime_and_definitions(cron_dir, reconciled_states, definitions)
+    _write_job_definitions_unlocked(
+        definitions,
+        removed_ids=removed_ids,
+        replace=replace,
+    )
+    clear_pending_definitions(cron_dir)
+
+
 def save_jobs(
     jobs: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
 ):
-    """Save all jobs to storage.
+    """Save jobs while keeping volatile state out of jobs.json.
 
-    See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
-    (shrink-merge guard against concurrent-create clobber, #80624).
+    ``removed_ids`` lists intentional deletes so the degraded-lock
+    shrink-merge does not restore them. ``replace=True`` requests an exact
+    wholesale rewrite (tests and disaster recovery).
     """
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
@@ -1793,10 +2110,10 @@ def create_job(
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Get a job by ID."""
+    """Get a visible, non-terminal job by ID."""
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == job_id:
+        if job["id"] == job_id and not job.get("runtime_tombstone"):
             return _normalize_job_record(job)
     return None
 
@@ -1824,7 +2141,7 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
-    jobs = load_jobs()
+    jobs = [job for job in load_jobs() if not job.get("runtime_tombstone")]
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -1840,8 +2157,12 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """List all jobs, optionally including disabled ones."""
-    jobs = [_normalize_job_record(j) for j in load_jobs()]
+    """List visible jobs, optionally including operator-disabled ones."""
+    jobs = [
+        _normalize_job_record(job)
+        for job in load_jobs()
+        if not job.get("runtime_tombstone")
+    ]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     try:
@@ -2108,9 +2429,15 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_preflight_alerted(job_id, False)
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    expected_fire_claim_id: Optional[str] = None,
+) -> bool:
     """
     Mark a job as having been run.
     
@@ -2130,6 +2457,19 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                if expected_fire_claim_id is not None:
+                    claim = job.get("fire_claim")
+                    current_claim_id = (
+                        claim.get("id") if isinstance(claim, dict) else None
+                    )
+                    if current_claim_id != expected_fire_claim_id:
+                        logger.warning(
+                            "Job '%s': stale fire owner %s cannot finalize claim %s",
+                            job_id,
+                            expected_fire_claim_id,
+                            current_claim_id,
+                        )
+                        return False
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
@@ -2178,15 +2518,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # last_delivery_error written above — a finished
                         # one-shot vanished from `cronjob list` with no
                         # inspectable outcome, and a failed delivery was
-                        # invisible. Mirror the terminal shape of the
-                        # next_run_at-is-None branch below; the retention
-                        # sweep prunes these after
-                        # COMPLETED_ONESHOT_RETENTION_DAYS.
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                        job["next_run_at"] = None
+                        # invisible. Hide terminal runtime state behind a
+                        # tombstone without deleting operator intent from the
+                        # stable definition artifact; _normalize_job_record()
+                        # derives the displayed "completed" state from this.
+                        job["runtime_tombstone"] = {
+                            "reason": "repeat_limit",
+                            "at": now,
+                        }
+                        jobs[i] = job
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -2221,9 +2563,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -2302,29 +2645,22 @@ def claim_dispatch(job_id: str) -> bool:
                 return True  # infinite — always dispatch
             completed = repeat.get("completed", 0)
             if completed >= times:
-                # Already dispatched the max number of times.
-                if job.get("last_run_at") is not None:
-                    # A prior run completed normally (e.g. mark_job_run raced
-                    # with this tick). Retain the terminal record — same shape
-                    # as mark_job_run's repeat-limit branch — instead of
-                    # deleting the job and its final status/delivery error.
-                    job["enabled"] = False
-                    job["state"] = "completed"
-                    job["next_run_at"] = None
-                    save_jobs(jobs)
-                    logger.info(
-                        "Job '%s': dispatch limit reached (%d/%d) — marking completed",
-                        job.get("name", job.get("id", "?")),
-                        completed,
-                        times,
-                    )
-                    return False
-                # A prior tick claimed the dispatch then died before the run
-                # completed (#73973) — a genuinely wedged claim. Remove it so
-                # it stops appearing as due, and leave an operator-visible
-                # diagnostic instead of vanishing silently.
-                jobs.pop(i)
-                save_jobs(jobs, removed_ids={job_id})
+                # Already dispatched the max number of times — whether a prior
+                # run completed normally (e.g. mark_job_run raced with this
+                # tick) or a prior tick claimed the dispatch then died before
+                # the run completed (#73973, a genuinely wedged claim).
+                # Tombstone rather than pop: deleting the job here would
+                # discard its final status/delivery error and drop it from
+                # `cronjob list` with no inspectable outcome. Same mechanism
+                # as mark_job_run's repeat-limit branch — _get_due_jobs_locked
+                # already excludes tombstoned jobs, so this still stops it
+                # appearing as due on every tick.
+                job["runtime_tombstone"] = {
+                    "reason": "dispatch_limit",
+                    "at": _hermes_now().isoformat(),
+                }
+                jobs[i] = job
+                save_jobs(jobs)
                 _write_wedged_oneshot_diagnostic(job)
                 logger.info(
                     "Job '%s': dispatch limit reached (%d/%d) — removing",
@@ -2352,7 +2688,12 @@ def claim_dispatch(job_id: str) -> bool:
         return True
 
 
-def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
+def heartbeat_run_claim(
+    job_id: str,
+    *,
+    expected_claim_id: Optional[str] = None,
+    expected_owner: Optional[str] = None,
+) -> bool:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive.
 
     Called periodically from the scheduler's run monitor (#62002) so a
@@ -2361,8 +2702,9 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     nor this process's own next tick will re-dispatch or stale-remove the job
     while the run is in flight. mark_job_run() clears the claim on completion.
 
-    ``expected_owner`` is the stable owner copied from the dispatched job. The
-    compare-and-refresh prevents a stale runner that resumes after a long sleep
+    New claims use ``expected_claim_id`` as an unguessable fencing token. The
+    owner label remains supported only for legacy claims that predate tokens.
+    Compare-and-refresh prevents a stale runner that resumes after a long sleep
     from extending a claim another scheduler process has since taken over.
 
     Returns True if this owner's one-shot claim was refreshed; False when the
@@ -2376,9 +2718,82 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             if job.get("schedule", {}).get("kind") != "once":
                 return False
             claim = job.get("run_claim")
-            if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+            if not isinstance(claim, dict):
+                return False
+            if expected_claim_id is not None:
+                if claim.get("id") != expected_claim_id:
+                    return False
+            elif expected_owner is not None:
+                if claim.get("id") is not None or claim.get("by") != expected_owner:
+                    return False
+            else:
                 return False
             claim["at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def heartbeat_fire_claim(job_id: str, *, expected_claim_id: str) -> bool:
+    """Refresh a fire claim only while its exact execution token owns it."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("id") != expected_claim_id:
+                return False
+            claim["at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def release_run_claim(
+    job_id: str,
+    *,
+    expected_claim_id: Optional[str] = None,
+    expected_owner: Optional[str] = None,
+) -> bool:
+    """Clear a one-shot run claim only while the caller still owns it."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for index, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("run_claim")
+            if not isinstance(claim, dict):
+                return False
+            if expected_claim_id is not None:
+                if claim.get("id") != expected_claim_id:
+                    return False
+            elif expected_owner is not None:
+                if claim.get("id") is not None or claim.get("by") != expected_owner:
+                    return False
+            else:
+                return False
+            updated = dict(job)
+            updated["run_claim"] = None
+            jobs[index] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def release_fire_claim(job_id: str, *, expected_claim_id: str) -> bool:
+    """Clear a fire claim only if the caller still owns its fencing token."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for index, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("id") != expected_claim_id:
+                return False
+            updated = dict(job)
+            updated["fire_claim"] = None
+            jobs[index] = updated
             save_jobs(jobs)
             return True
     return False
@@ -2455,27 +2870,11 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
-    """Atomically claim a job for a single external 'fire' (multi-machine
-    at-most-once). Returns True iff THIS caller won the claim.
-
-    Used by the external-provider fire path (``CronScheduler.fire_due``) when an
-    external scheduler (Chronos) signals a job is due across N gateway replicas:
-    exactly one wins. Single-machine deployments always win.
-
-    Under the file lock: reject if the job is missing/disabled/paused. If a
-    fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
-    Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
-    re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
-    but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
-    ``mark_job_run`` clears the claim on completion so a re-armed recurring job
-    is claimable again next fire.
-
-    The stale-claim TTL means a machine that crashed after claiming but before
-    completing doesn't wedge the job forever — after the TTL another fire can
-    reclaim it.
-    """
+def claim_job_for_fire_token(
+    job_id: str, *, claim_ttl_seconds: int = 300
+) -> Optional[str]:
+    """Atomically claim one fire and return its unique fencing token."""
+    claim_id = uuid.uuid4().hex
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -2484,32 +2883,38 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             # enabled + pause markers must both clear — a half-paused record
             # (enabled=true, state=paused/paused_at set) must not claim.
             if not is_job_runnable(job):
-                return False
+                return None
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
                 try:
                     claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
-                    # Bounded on BOTH sides (#60703): a claim stamped in the
-                    # future (clock/TZ skew across a restart, or a corrupted
-                    # timestamp) would otherwise have a negative age and stay
-                    # "fresh" forever — the job becomes permanently unfireable
-                    # and every manual `cron run` reports "already being
-                    # fired". Treat future-dated claims as stale/overwritable.
-                    _age = (now - claimed_at).total_seconds()
-                    if 0 <= _age < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
+                    # Bound age on both sides: future-dated claims are stale.
+                    age = (now - claimed_at).total_seconds()
+                    if 0 <= age < claim_ttl_seconds:
+                        return None
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "id": claim_id,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
-            return True
-        return False
+            return claim_id
+        return None
+
+
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+    """Compatibility wrapper returning whether this caller won a fire claim."""
+    return claim_job_for_fire_token(
+        job_id, claim_ttl_seconds=claim_ttl_seconds
+    ) is not None
 
 
 # Completed one-shot job records are retained in jobs.json (final status +
@@ -2638,7 +3043,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             rj["id"] = rj.pop("job_id", None) or uuid.uuid4().hex[:12]
             needs_save = True
 
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs = [
+        _apply_skill_fields(job)
+        for job in copy.deepcopy(raw_jobs)
+        if not job.get("runtime_tombstone")
+    ]
     due = []
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,
@@ -2947,8 +3356,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             )
                             for rj in raw_jobs:
                                 if rj["id"] == job["id"]:
-                                    raw_jobs.remove(rj)
-                                    intentionally_removed.add(str(rj["id"]))
+                                    rj["runtime_tombstone"] = {
+                                        "reason": "stale_dispatch_limit",
+                                        "at": now.isoformat(),
+                                    }
                                     needs_save = True
                                     break
                             # The claimed run never completed here by
@@ -2975,7 +3386,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # (_oneshot_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT),
                 # so the job is re-dispatched rather than wedged forever.
                 if kind == "once":
-                    claim = {"at": now.isoformat(), "by": _machine_id()}
+                    claim = {
+                        "id": uuid.uuid4().hex,
+                        "at": now.isoformat(),
+                        "by": _machine_id(),
+                    }
                     job["run_claim"] = claim
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
