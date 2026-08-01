@@ -97,10 +97,10 @@ def _warn_if_gateway_not_running() -> None:
 
 
 def cron_list(show_all: bool = False):
-    """List all scheduled jobs."""
+    """List all scheduled jobs; ``show_all`` includes disabled and completed."""
     from cron.jobs import list_jobs
 
-    jobs = list_jobs(include_disabled=show_all)
+    jobs = list_jobs(include_disabled=show_all, include_terminal=show_all)
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -123,6 +123,14 @@ def cron_list(show_all: bool = False):
         # enabled=true (half-paused contradiction must not look frozen).
         state = effective_job_state(job)
         next_run = job.get("next_run_at", "?")
+        # A runtime-tombstoned job's stored next_run_at predates its
+        # completion; showing it as an upcoming run would be misleading.
+        tombstone = job.get("runtime_tombstone")
+        if tombstone:
+            next_run = (
+                f"— completed {tombstone.get('at', '?')} "
+                f"({tombstone.get('reason', '?')})"
+            )
 
         # `repeat` may be present-but-null in the job record (e.g. a one-shot
         # job persisted with "repeat": null), so coalesce to {} rather than
