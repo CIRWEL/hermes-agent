@@ -502,6 +502,21 @@ def _format_size(nbytes: int) -> str:
     return f"{nbytes:.1f} TB"
 
 
+def _is_cron_pair_archive_path(path: Path) -> bool:
+    """Return whether a path is a root or named-profile cron pair member."""
+    parts = path.parts
+    return (
+        len(parts) == 2
+        and parts[0] == "cron"
+        and parts[1] in {"jobs.json", "runtime.db"}
+    ) or (
+        len(parts) == 4
+        and parts[0] == "profiles"
+        and parts[2] == "cron"
+        and parts[3] in {"jobs.json", "runtime.db"}
+    )
+
+
 def _prepare_full_backup_cron_pair(
     *,
     home: Path,
@@ -688,6 +703,7 @@ def run_backup(args) -> None:
 
     total_bytes = 0
     errors = []
+    cron_pair_write_failed = False
     t0 = time.monotonic()
 
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -704,18 +720,26 @@ def run_backup(args) -> None:
                     ) as tmp:
                         tmp_db = Path(tmp.name)
                     if _safe_copy_db(abs_path, tmp_db):
-                        zf.write(tmp_db, arcname=str(rel_path))
-                        total_bytes += tmp_db.stat().st_size
-                        tmp_db.unlink(missing_ok=True)
+                        try:
+                            zf.write(tmp_db, arcname=str(rel_path))
+                            total_bytes += tmp_db.stat().st_size
+                        finally:
+                            tmp_db.unlink(missing_ok=True)
                     else:
                         tmp_db.unlink(missing_ok=True)
                         errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        if _is_cron_pair_archive_path(rel_path):
+                            cron_pair_write_failed = True
+                            break
                         continue
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
                     total_bytes += abs_path.stat().st_size
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {rel_path}: {exc}")
+                if _is_cron_pair_archive_path(rel_path):
+                    cron_pair_write_failed = True
+                    break
                 continue
 
             # Progress every 500 files
@@ -725,16 +749,22 @@ def run_backup(args) -> None:
         # External memory-provider state, stored under the ``_external/`` arc
         # prefix. These never include ``.db`` files in practice (config/env
         # blobs), so a straight zf.write is fine.
-        for abs_path, arcname in external_to_add:
-            try:
-                zf.write(abs_path, arcname=arcname)
-                total_bytes += abs_path.stat().st_size
-            except (PermissionError, OSError, ValueError) as exc:
-                errors.append(f"  {arcname}: {exc}")
-                continue
+        if not cron_pair_write_failed:
+            for abs_path, arcname in external_to_add:
+                try:
+                    zf.write(abs_path, arcname=arcname)
+                    total_bytes += abs_path.stat().st_size
+                except (PermissionError, OSError, ValueError) as exc:
+                    errors.append(f"  {arcname}: {exc}")
+                    continue
 
     if cron_stage is not None:
         cron_stage.cleanup()
+
+    if cron_pair_write_failed:
+        out_path.unlink(missing_ok=True)
+        print("Backup aborted: a coherent cron pair could not be archived.")
+        return
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
@@ -1963,6 +1993,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
         return None
 
     sqlite_snapshot_failed = False
+    cron_pair_write_failed = False
     try:
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for abs_path, rel_path in files_to_add:
@@ -1990,6 +2021,14 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                     else:
                         zf.write(abs_path, arcname=str(rel_path))
                 except (PermissionError, OSError, ValueError) as exc:
+                    if _is_cron_pair_archive_path(rel_path):
+                        logger.warning(
+                            "Full-zip backup aborted: cron pair write failed for %s: %s",
+                            rel_path,
+                            exc,
+                        )
+                        cron_pair_write_failed = True
+                        break
                     logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
                     continue
     except OSError as exc:
@@ -2004,7 +2043,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
         if cron_stage is not None:
             cron_stage.cleanup()
 
-    if sqlite_snapshot_failed:
+    if sqlite_snapshot_failed or cron_pair_write_failed:
         try:
             out_path.unlink(missing_ok=True)
         except OSError:
