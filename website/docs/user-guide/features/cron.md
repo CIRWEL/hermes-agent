@@ -248,7 +248,7 @@ hermes cron status
 
 On each tick Hermes:
 
-1. loads jobs from `~/.hermes/cron/jobs.json`
+1. loads jobs — definitions from `~/.hermes/cron/jobs.json`, live run state from `~/.hermes/cron/runtime.db`
 2. checks `next_run_at` against the current time
 3. starts a fresh `AIAgent` session for each due job
 4. optionally injects one or more attached skills into that fresh session
@@ -777,7 +777,12 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 
 ## Job storage
 
-Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
+Job storage is split across two files:
+
+- **`~/.hermes/cron/jobs.json`** holds the job *definitions* — what you asked for: name, prompt, schedule, repeat limit, delivery target, skills, and any model/provider pins. This file only changes when you create, edit, or remove a job, so it stays stable and diff-friendly (you can keep it in version control).
+- **`~/.hermes/cron/runtime.db`** holds the *live run state* — next/last run times, success/error status, how many repeats have completed, and in-flight ownership markers. Every job run updates this file, never `jobs.json`.
+
+Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
 
 :::tip
 Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or `/cron` — not by patching `jobs.json` directly. Direct edits can fail silently when [file write safety](../security.md#file-write-safety) blocks the path (for example when `HERMES_WRITE_SAFE_ROOT` is set), and the [file-mutation verifier](../configuration.md#file-mutation-verifier) footer is the authoritative signal that nothing was saved.
@@ -785,7 +790,19 @@ Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or 
 
 Jobs may store `model` and `provider` as `null`. When those fields are omitted, Hermes resolves them at execution time from the global configuration. They only appear in the job record when a per-job override is set.
 
-The storage uses atomic file writes so interrupted writes do not leave a partially written job file behind.
+The storage uses atomic file writes so interrupted writes do not leave a partially written job file behind. Older single-file stores (where run state lived inside `jobs.json`) migrate automatically the first time the new version loads them — schedules and repeat counters are preserved.
+
+:::warning Back up both files together
+`jobs.json` and `runtime.db` only make sense as a matched pair. `hermes backup` and quick snapshots always capture them together under a lock; if you copy cron state by hand, copy both files, or a restore can re-fire already-completed one-shots or lose repeat progress.
+:::
+
+### Completed jobs
+
+A job that finishes its repeat limit (for example a one-shot that has fired) is **not deleted** — it is kept as a completed declaration so the definition remains reproducible. Completed jobs are hidden from normal listings:
+
+- `hermes cron list --all` (or `cronjob(action="list", include_completed=True)`) shows them with state `completed`.
+- `hermes cron remove <job>` deletes a completed job for good.
+- `hermes cron resume <job>` or `hermes cron run <job>` **revives** it: the completed marker clears and the repeat budget resets, so it can fire again. Editing a completed job (`hermes cron edit`) revives it the same way.
 
 ## Self-contained prompts still matter
 

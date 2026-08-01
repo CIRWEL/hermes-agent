@@ -518,6 +518,11 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
+    # A runtime-tombstoned declaration is terminal regardless of what the
+    # stored state says: present it as "completed" so list/get consumers can
+    # distinguish it from schedulable jobs without inspecting the tombstone.
+    if normalized.get("runtime_tombstone"):
+        state = "completed"
     normalized["state"] = state
 
     return normalized
@@ -1131,9 +1136,15 @@ def _reconcile_runtime_state(
         )
         reconciled.pop("runtime_tombstone", None)
     elif prior_definition_digest and prior_definition_digest != definition_digest:
-        # Any operator edit revives a runtime-tombstoned declaration. Cadence
-        # and history remain intact unless the cadence digest changed above.
-        reconciled.pop("runtime_tombstone", None)
+        # Any operator edit revives a runtime-tombstoned declaration. Run
+        # history remains intact unless the cadence digest changed above, but
+        # the repeat budget must reset with the tombstone: an exhausted count
+        # left in place would re-tombstone the revived job on the very next
+        # due scan (stale_dispatch_limit) without it ever firing.
+        if reconciled.pop("runtime_tombstone", None) is not None:
+            reconciled[_RUNTIME_REPEAT_COMPLETED] = 0
+            reconciled["fire_claim"] = None
+            reconciled["run_claim"] = None
 
     reconciled[_RUNTIME_DEFINITION_DIGEST] = definition_digest
     reconciled[_RUNTIME_SCHEDULE_DIGEST] = schedule_digest
@@ -1748,12 +1759,23 @@ def create_job(
     return job
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Get a visible, non-terminal job by ID."""
+def get_job(
+    job_id: str, *, include_completed: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Get a visible job by ID.
+
+    Runtime-completed (tombstoned) declarations are hidden unless
+    ``include_completed`` is set, so schedulable-job consumers never see
+    terminal records by accident while management surfaces can still reach
+    them explicitly.
+    """
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == job_id and not job.get("runtime_tombstone"):
-            return _normalize_job_record(job)
+        if job["id"] != job_id:
+            continue
+        if job.get("runtime_tombstone") and not include_completed:
+            return None
+        return _normalize_job_record(job)
     return None
 
 
@@ -1770,17 +1792,26 @@ class AmbiguousJobReference(LookupError):
         )
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+def resolve_job_ref(
+    ref: str, *, include_completed: bool = False
+) -> Optional[Dict[str, Any]]:
     """Resolve a job reference (ID or name) to a job record.
 
     - Exact ID match wins (works even if a different job's name equals this ID).
     - Otherwise, case-insensitive name match.
     - If a name matches more than one job, raises AmbiguousJobReference so the
       caller can surface the matching IDs rather than silently picking one.
+    - Runtime-completed (tombstoned) declarations resolve only when
+      ``include_completed`` is set — management surfaces that remove or revive
+      terminal declarations opt in; everything else keeps seeing live jobs only.
     """
     if not ref:
         return None
-    jobs = [job for job in load_jobs() if not job.get("runtime_tombstone")]
+    jobs = [
+        job
+        for job in load_jobs()
+        if include_completed or not job.get("runtime_tombstone")
+    ]
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -1795,15 +1826,24 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """List visible jobs, optionally including operator-disabled ones."""
-    jobs = [
-        _normalize_job_record(job)
-        for job in load_jobs()
-        if not job.get("runtime_tombstone")
-    ]
-    if not include_disabled:
-        jobs = [j for j in jobs if j.get("enabled", True)]
+def list_jobs(
+    include_disabled: bool = False, include_completed: bool = False
+) -> List[Dict[str, Any]]:
+    """List visible jobs.
+
+    ``include_disabled`` adds operator-paused jobs; ``include_completed`` adds
+    runtime-completed (tombstoned) declarations, shown with state
+    ``"completed"``. Completed declarations are exempt from the enabled filter:
+    asking for them explicitly means the caller wants every terminal record.
+    """
+    jobs = []
+    for job in load_jobs():
+        tombstoned = bool(job.get("runtime_tombstone"))
+        if tombstoned and not include_completed:
+            continue
+        if not tombstoned and not include_disabled and not job.get("enabled", True):
+            continue
+        jobs.append(_normalize_job_record(job))
     try:
         from cron.executions import latest_executions
 
@@ -1912,8 +1952,34 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
-            return _normalize_job_record(jobs[i])
+            # Re-read after save: reconciliation happens inside save_jobs
+            # (cadence reset on schedule change, tombstone revival on edit),
+            # so returning the pre-save merged record would hand callers a
+            # stale repeat count or a runtime_tombstone that storage already
+            # cleared. The jobs lock is reentrant, so this nested read is safe.
+            saved = next(
+                (j for j in load_jobs() if j["id"] == job_id), jobs[i]
+            )
+            return _normalize_job_record(saved)
     return None
+
+
+def _revive_updates(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Updates that clear terminal runtime state so a declaration fires again.
+
+    The repeat budget resets alongside the tombstone — a revived job whose
+    ``repeat.completed`` still equals ``repeat.times`` would be re-tombstoned
+    by the next due scan before it could fire.
+    """
+    updates: Dict[str, Any] = {
+        "runtime_tombstone": None,
+        "fire_claim": None,
+        "run_claim": None,
+    }
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict):
+        updates["repeat"] = {**repeat, "completed": 0}
+    return updates
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -1933,50 +1999,66 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    """Resume a paused job and compute the next future run from now.
+
+    Accepts a job ID or name. Also revives a runtime-completed declaration:
+    the tombstone clears and the repeat budget resets so the schedule arms
+    again from scratch.
+    """
+    job = resolve_job_ref(job_id, include_completed=True)
     if not job:
         return None
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
+        if job.get("runtime_tombstone"):
+            raise ValueError(
+                f"Cannot revive completed job: one-shot time {run_at} is in "
+                f"the past (grace window: {ONESHOT_GRACE_SECONDS}s). Trigger "
+                f"it to run now, or update its schedule to a future time."
+            )
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+    updates = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": next_run_at,
+    }
+    if job.get("runtime_tombstone"):
+        updates.update(_revive_updates(job))
+    return update_job(job["id"], updates)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    """Schedule a job to run on the next scheduler tick.
+
+    Accepts a job ID or name. A runtime-completed declaration is revived
+    first (tombstone cleared, repeat budget reset) so the fire actually
+    dispatches instead of tripping the dispatch-limit guard.
+    """
+    job = resolve_job_ref(job_id, include_completed=True)
     if not job:
         return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
-    )
+    updates = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": _hermes_now().isoformat(),
+    }
+    if job.get("runtime_tombstone"):
+        updates.update(_revive_updates(job))
+    return update_job(job["id"], updates)
 
 
 def remove_job(job_id: str) -> bool:
-    """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
+    """Remove a job by ID or name, including runtime-completed declarations."""
+    job = resolve_job_ref(job_id, include_completed=True)
     if not job:
         return False
     canonical_id = job["id"]

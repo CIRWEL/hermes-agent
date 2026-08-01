@@ -182,7 +182,7 @@ class TestExternalCronProviderStatus:
 def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     monkeypatch.setattr(
         "cron.jobs.list_jobs",
-        lambda include_disabled=False: [
+        lambda include_disabled=False, include_completed=False: [
             {
                 "id": "job-1",
                 "name": "Nightly docs",

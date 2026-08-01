@@ -12,11 +12,13 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 
 | File | Purpose |
 |------|---------|
-| `cron/jobs.py` | Job model, storage, atomic read/write to `jobs.json` |
+| `cron/jobs.py` | Job model and storage — declarative definitions in `jobs.json`, runtime overlay, reconciliation |
+| `cron/runtime_state.py` | SQLite-backed volatile runtime store (`runtime.db`) — claims, counters, tombstones |
 | `cron/scheduler.py` | Scheduler loop — due-job detection, execution, repeat tracking |
 | `tools/cronjob_tools.py` | Model-facing `cronjob` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
+| `hermes_cli/backup.py` | Backup/restore — captures `jobs.json` + `runtime.db` as one coherent pair |
 
 ## Scheduling Model
 
@@ -33,7 +35,16 @@ The model-facing surface is a single `cronjob` tool with action-style operations
 
 ## Job Storage
 
-Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write to temp file, then rename). Each job record contains:
+Job storage is split into two profile-local stores that `cron/jobs.py` joins on read:
+
+- **`~/.hermes/cron/jobs.json`** — the *declarative definition artifact*: operator intent only (id, name, prompt, schedule, `repeat.times`, delivery, skills, pins). Written atomically (temp file + rename) and byte-stable across ordinary job runs, so it stays diff-friendly and reproducible in source control.
+- **`~/.hermes/cron/runtime.db`** — a SQLite store (`cron/runtime_state.py`) holding *volatile runtime state* keyed by job id: `next_run_at`, `last_run_at`/`last_status`/`last_error`, `repeat.completed`, fire/run ownership claims, provider/model snapshots, and terminal `runtime_tombstone` markers.
+
+`load_jobs()` overlays runtime state onto the definitions so every consumer still sees the familiar combined record shown below. `save_jobs()` partitions records back into the two stores; when a save changes definitions, runtime and the desired definitions commit together in SQLite first (a journaled write) so an interrupted `jobs.json` materialization can be finished idempotently on the next load. Legacy combined `jobs.json` stores migrate automatically on first load — runtime fields move into `runtime.db` and the definition artifact is rewritten without them, preserving schedules and counters.
+
+Runtime state is bound to its definition by content digests: editing a job's schedule, `repeat.times`, or enabled flag resets cadence state (`next_run_at`, `repeat.completed`, claims), and any definition edit revives a runtime-tombstoned declaration (see below).
+
+The combined record contains:
 
 ```json
 {
@@ -69,8 +80,20 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 |-------|---------|
 | `scheduled` | Active, will fire at next scheduled time |
 | `paused` | Suspended — won't fire until resumed |
-| `completed` | Repeat count exhausted or one-shot that has fired |
+| `completed` | Repeat count exhausted or one-shot that has fired — retained as a declaration (see below) |
 | `running` | Currently executing (transient state) |
+
+### Completed Jobs (Runtime Tombstones)
+
+When a job exhausts its repeat budget (`repeat.completed >= repeat.times`), the definition is **not deleted** from `jobs.json`. Instead a `runtime_tombstone` marker (`reason` + timestamp) is written to `runtime.db`, hiding the job from default lookup surfaces while keeping the operator's intent reproducible. `export_job_definitions()` still returns tombstoned declarations.
+
+Terminal declarations stay fully manageable through explicit pathways:
+
+- **List** — `list_jobs(include_completed=True)` (tool: `cronjob(action='list', include_completed=True)`, CLI: `hermes cron list --all`) shows them with `state: "completed"`.
+- **Get/resolve** — `get_job(...)` / `resolve_job_ref(...)` accept `include_completed=True`.
+- **Remove** — `remove_job()` resolves completed declarations, deleting the definition, its runtime row, and its output directory.
+- **Revive** — `resume_job()` / `trigger_job()` (tool actions `resume` / `run`, and the matching CLI subcommands) clear the tombstone **and reset the repeat budget** (`repeat.completed = 0`) so the job actually fires again instead of tripping the dispatch-limit guard. Editing a completed job's definition (`update_job`, `hermes cron edit`) revives it the same way.
+- **Pause** — not applicable; a completed job has nothing to pause and the tool returns an actionable error.
 
 ### Backward Compatibility
 
@@ -85,18 +108,19 @@ The scheduler runs on a periodic tick (default: every 60 seconds):
 ```text
 tick()
   1. Acquire scheduler lock (prevents overlapping ticks)
-  2. Load all jobs from jobs.json
+  2. Load jobs (definitions from jobs.json overlaid with runtime.db state)
   3. Filter to due jobs (next_run <= now AND state == "scheduled")
   4. For each due job:
-     a. Set state to "running"
+     a. Claim the fire (durable ownership token in runtime.db)
      b. Create fresh AIAgent session (no conversation history)
      c. Load attached skills in order (injected as user messages)
      d. Run the job prompt through the agent
      e. Deliver the response to the configured target
-     f. Update run_count, compute next_run
-     g. If repeat count exhausted → state = "completed"
+     f. Update completed count, compute next_run
+     g. If repeat count exhausted → runtime tombstone (state "completed";
+        the declaration is retained in jobs.json)
      h. Otherwise → state = "scheduled"
-  5. Write updated jobs back to jobs.json
+  5. Persist runtime updates to runtime.db (jobs.json is untouched by runs)
   6. Release scheduler lock
 ```
 
@@ -295,6 +319,17 @@ hermes cron resume <job_id>         # Resume a paused job
 hermes cron run <job_id>            # Trigger immediate execution
 hermes cron remove <job_id>         # Delete a job
 ```
+
+## Backup and Restore: The Cron Pair
+
+Because a job's identity lives in `jobs.json` while its cadence, counters, claims, and tombstones live in `runtime.db`, the two files are only meaningful as a **matched generation**. Backing up one without the other (or from different moments) can resurrect already-completed one-shots, lose fire ownership, or erase repeat progress on restore.
+
+`hermes_cli/backup.py` therefore treats `cron/jobs.json` + `cron/runtime.db` as a single unit for the root profile and every named profile:
+
+- **Full backups and quick snapshots** capture the pair under the profile-local cron store lock in strict mode (`_snapshot_cron_pair`), copying the SQLite side via the safe backup API and verifying integrity. If a coherent pair cannot be captured, the backup **fails closed** for that profile — it never writes a torn pair.
+- **Restore** stages both files back together, so the runtime generation always matches the definitions it is restored beside.
+
+Anything that copies cron state by hand (scripts, sync jobs) must copy both files under the same lock, or go through the backup CLI.
 
 ## Related Docs
 

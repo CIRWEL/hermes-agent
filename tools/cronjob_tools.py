@@ -32,6 +32,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    trigger_job,
     update_job,
 )
 
@@ -555,6 +556,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    tombstone = job.get("runtime_tombstone")
+    if isinstance(tombstone, dict):
+        result["completed_at"] = tombstone.get("at")
+        result["completed_reason"] = tombstone.get("reason")
     if job.get("script"):
         result["script"] = job["script"]
     if job.get("no_agent"):
@@ -615,8 +620,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
+        # Read back with include_completed=True: a finite one-shot tombstones
+        # itself inside mark_job_run, and a filtered readback would misreport
+        # a successful run as {"success": False}.
         processed = run_one_job(claimed_job)
-        refreshed = get_job(job_id) or {}
+        refreshed = get_job(job_id, include_completed=True) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
             "claimed": True,
@@ -652,6 +660,7 @@ def cronjob(
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
     include_disabled: bool = False,
+    include_completed: bool = False,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
@@ -761,14 +770,25 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            jobs = [
+                _format_job(job)
+                for job in list_jobs(
+                    include_disabled=include_disabled,
+                    include_completed=include_completed,
+                )
+            ]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
         try:
-            job = resolve_job_ref(job_id)
+            # Resolve terminal (runtime-completed) declarations too: remove,
+            # resume, run, and update are exactly the management pathways that
+            # must still reach a repeat-exhausted job (list them with
+            # include_completed=True). Actions where a completed job makes no
+            # sense guard explicitly below.
+            job = resolve_job_ref(job_id, include_completed=True)
         except AmbiguousJobReference as exc:
             return json.dumps(
                 {
@@ -813,6 +833,13 @@ def cronjob(
             )
 
         if normalized == "pause":
+            if job.get("runtime_tombstone"):
+                return tool_error(
+                    f"Job '{job['name']}' has already completed its repeat "
+                    "limit; there is nothing to pause. Use action='resume' or "
+                    "action='run' to revive it, or action='remove' to delete it.",
+                    success=False,
+                )
             updated = pause_job(job_id, reason=reason)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
@@ -828,6 +855,19 @@ def cronjob(
             # no gateway/ticker is active (the #41037 case). The claim inside
             # _execute_job_now advances next_run_at and blocks a concurrent tick
             # from double-firing.
+            if job.get("runtime_tombstone"):
+                # A manual run of a completed declaration is an explicit
+                # revival: clear the terminal state (and reset the repeat
+                # budget) first, or the dispatch-limit guard would refuse
+                # the fire and immediately re-tombstone the job.
+                revived = trigger_job(job_id)
+                if not revived:
+                    return tool_error(
+                        f"Failed to revive completed job '{job_id}' for a "
+                        "manual run.",
+                        success=False,
+                    )
+                job = revived
             exec_result = _execute_job_now(job)
             # A claimed direct run advances next_run_at and may race the
             # external one-shot for the same occurrence. If Chronos loses that
@@ -836,7 +876,9 @@ def cronjob(
             if exec_result.get("claimed", False):
                 _notify_provider_jobs_changed_safe()
             # Re-read so the response reflects the post-run last_run_at/last_status.
-            result = _format_job(get_job(job_id) or {"id": job_id})
+            # include_completed: a finite one-shot that just consumed its final
+            # repeat is tombstoned by now but its record still belongs in the reply.
+            result = _format_job(get_job(job_id, include_completed=True) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
@@ -970,6 +1012,8 @@ Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
+Jobs that exhausted their repeat limit stay retained as completed declarations (state='completed'); they are hidden from action='list' unless include_completed=True. They can still be removed, edited, or revived: action='resume' or action='run' clears the completed state and resets the repeat budget.
+
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
@@ -989,6 +1033,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "job_id": {
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run"
+            },
+            "include_completed": {
+                "type": "boolean",
+                "default": False,
+                "description": "For action=list: also include jobs that finished their repeat limit (state='completed'). Completed jobs are retained as declarations and can be removed, edited, or revived (resume/run)."
             },
             "prompt": {
                 "type": "string",

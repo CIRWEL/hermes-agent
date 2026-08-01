@@ -100,7 +100,10 @@ def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
 
-    jobs = list_jobs(include_disabled=show_all)
+    # --all surfaces every retained declaration: paused jobs AND
+    # runtime-completed ones (state "completed"), which stay removable,
+    # editable, and revivable via resume/run.
+    jobs = list_jobs(include_disabled=show_all, include_completed=show_all)
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -377,7 +380,9 @@ def cron_edit(args):
     from cron.jobs import AmbiguousJobReference, resolve_job_ref
 
     try:
-        job = resolve_job_ref(args.job_id)
+        # include_completed: editing a repeat-exhausted declaration is a
+        # supported revival pathway — the update clears its completed state.
+        job = resolve_job_ref(args.job_id, include_completed=True)
     except AmbiguousJobReference as exc:
         print(color(str(exc), Colors.RED))
         for m in exc.matches:
