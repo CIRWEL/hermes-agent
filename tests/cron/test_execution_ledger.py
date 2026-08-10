@@ -159,7 +159,8 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert records[0]["id"] == execution_id
     assert records[0]["status"] == "unknown"
     assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
+    assert "owner exited" in records[0]["error"].lower()
+    assert "unknown" in records[0]["error"].lower()
     # Recovery only classifies the old attempt. It must not manufacture a new
     # claimed record (which would imply an automatic retry).
     assert [r["status"] for r in records] == ["unknown"]
@@ -265,7 +266,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
-def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
+def test_provider_start_does_no_recovery_after_shutdown_requested(monkeypatch):
     import cron.scheduler_provider as provider
 
     events = []
@@ -280,7 +281,7 @@ def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
 
     provider.InProcessCronScheduler().start(stop, interval=1)
 
-    assert events[:2] == ["recover", "heartbeat"]
+    assert events == []
 
 
 def test_external_provider_start_recovers_interrupted_records(monkeypatch):
@@ -298,6 +299,40 @@ def test_external_provider_start_recovers_interrupted_records(monkeypatch):
     provider.start(__import__("threading").Event())
 
     assert events == ["recover", "reconcile"]
+
+
+def test_external_provider_recovery_error_does_not_skip_reconcile(monkeypatch):
+    """Audit maintenance is never a prerequisite for arming remote schedules."""
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    provider = ChronosCronScheduler()
+    events = []
+    monkeypatch.setattr(
+        provider,
+        "recover_interrupted",
+        lambda: (_ for _ in ()).throw(OSError("ledger busy")),
+    )
+    monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
+
+    provider.start(__import__("threading").Event())
+
+    assert events == ["reconcile"]
+
+
+def test_external_provider_honors_preset_shutdown_before_maintenance(monkeypatch):
+    """A provider that is already stopping must not scan or arm anything."""
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    provider = ChronosCronScheduler()
+    events = []
+    stop = __import__("threading").Event()
+    stop.set()
+    monkeypatch.setattr(provider, "recover_interrupted", lambda: events.append("recover"))
+    monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
+
+    provider.start(stop)
+
+    assert events == []
 
 
 class _TrackingConnection:

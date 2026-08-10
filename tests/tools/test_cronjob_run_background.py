@@ -67,7 +67,7 @@ class TestBackgroundDispatch:
             return True
 
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+            with patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-01") as m_claim, \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
@@ -85,6 +85,37 @@ class TestBackgroundDispatch:
         finally:
             run_release.set()
 
+    def test_background_worker_forwards_nonempty_extra_prompt(self):
+        """Manual instructions survive the isolated background handoff."""
+        observed = {}
+        run_started = threading.Event()
+
+        def probe_run(_job, **kwargs):
+            observed.update(kwargs)
+            run_started.set()
+            return True
+
+        with _bound_session_key("agent:main:telegram:dm:extra-prompt"):
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire_token",
+                return_value="claim-bg-extra-prompt",
+            ), patch(
+                "cron.scheduler.run_one_job",
+                side_effect=probe_run,
+            ), patch(
+                "tools.cronjob_tools.get_job",
+                return_value={"last_status": "ok", "last_error": None},
+            ):
+                res = _try_dispatch_background_run(
+                    _job("job-bg-extra-prompt"),
+                    extra_prompt="include the fresh sensor reading",
+                )
+                assert res is not None
+                assert res["dispatched"] is True
+                assert run_started.wait(timeout=5.0)
+
+        assert observed["extra_prompt"] == "include the fresh sensor reading"
+
     def test_completion_event_reaches_shared_queue(self):
         """The finished run pushes a type='async_delegation' event carrying
         the job outcome onto process_registry.completion_queue."""
@@ -95,7 +126,7 @@ class TestBackgroundDispatch:
         # The runner executes on a daemon thread — the patches must stay
         # active until the completion event lands, so poll INSIDE the blocks.
         with _bound_session_key("agent:main:telegram:dm:777"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-02"), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
@@ -128,7 +159,7 @@ class TestBackgroundDispatch:
         from tools.process_registry import process_registry
 
         with _bound_session_key("agent:main:telegram:dm:778"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-03"), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
@@ -156,13 +187,33 @@ class TestBackgroundDispatch:
         """Paused/already-firing jobs report in the tool response, not as a
         delayed completion event."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+            with patch("tools.cronjob_tools.claim_job_for_fire_token", return_value=None), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={**_JOB, "enabled": False}), \
                  patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                 res = _try_dispatch_background_run(_job('job-bg-04'))
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
+        m_disp.assert_not_called()
+
+    def test_claim_exception_fails_closed_without_finalization(self):
+        """No fencing token means no authority to mutate another owner's run."""
+        with _bound_session_key():
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire_token",
+                side_effect=RuntimeError("claim store unavailable"),
+            ), patch("tools.cronjob_tools.mark_job_run") as m_mark, patch(
+                "tools.async_delegation.dispatch_async_delegation"
+            ) as m_disp:
+                res = _try_dispatch_background_run(_job("job-bg-claim-error"))
+
+        assert res == {
+            "claimed": False,
+            "dispatched": False,
+            "success": False,
+            "error": "claim store unavailable",
+        }
+        m_mark.assert_not_called()
         m_disp.assert_not_called()
 
 
@@ -183,7 +234,7 @@ class TestSyncFallbacks:
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-07"), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -193,6 +244,33 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+
+    def test_submit_exception_releases_exact_claim_without_running(self):
+        """A pre-acceptance submit error cannot strand or execute the claim."""
+        with _bound_session_key():
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire_token",
+                return_value="claim-bg-submit-error",
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=RuntimeError("executor unavailable"),
+            ), patch(
+                "tools.cronjob_tools.release_fire_claim",
+                return_value=True,
+            ) as m_release, patch(
+                "cron.scheduler.run_one_job"
+            ) as m_run:
+                res = _try_dispatch_background_run(_job("job-bg-submit-error"))
+
+        assert res["claimed"] is True
+        assert res["dispatched"] is False
+        assert res["success"] is False
+        assert "executor unavailable" in res["error"]
+        m_release.assert_called_once_with(
+            "job-bg-submit-error",
+            expected_claim_id="claim-bg-submit-error",
+        )
+        m_run.assert_not_called()
 
 
 class TestInFlightDedupe:
@@ -209,7 +287,9 @@ class TestInFlightDedupe:
         assert sched.try_register_running_job("job-bg-08")   # simulate ticker mid-run
         try:
             with patch("cron.scheduler.run_one_job") as m_run:
-                res = _run_claimed_job(_job('job-bg-08'))
+                res = _run_claimed_job(
+                    _job('job-bg-08'), claim_id="claim-bg-08"
+                )
             assert res["success"] is False
             assert "already running" in res["error"]
             m_run.assert_not_called()
@@ -231,7 +311,9 @@ class TestInFlightDedupe:
         with patch("cron.scheduler.run_one_job", side_effect=probe_run), \
              patch("tools.cronjob_tools.get_job",
                    return_value={"last_status": "ok", "last_error": None}):
-            res = _run_claimed_job(_job('job-bg-09'))
+            res = _run_claimed_job(
+                _job('job-bg-09'), claim_id="claim-bg-09"
+            )
 
         assert res["success"] is True
         assert seen_during_run["registered"] is True
@@ -245,7 +327,7 @@ class TestInFlightDedupe:
         assert sched.try_register_running_job("job-bg-10")
         try:
             with _bound_session_key():
-                with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim, \
+                with patch("tools.cronjob_tools.claim_job_for_fire_token") as m_claim, \
                      patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                     res = _try_dispatch_background_run(_job('job-bg-10'))
             assert res["claimed"] is False
@@ -278,7 +360,7 @@ class TestCronjobRunToolIntegration:
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
-                 patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+                 patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-12"), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
@@ -296,7 +378,7 @@ class TestCronjobRunToolIntegration:
         execution_success populated from the completed run)."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-13')), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+             patch("tools.cronjob_tools.claim_job_for_fire_token", return_value="claim-bg-13") as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-bg-13"))

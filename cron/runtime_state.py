@@ -10,13 +10,17 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, Iterator, Mapping, Optional, Sequence
 
 
 _RUNTIME_DB_NAME = "runtime.db"
+_SCHEMA_INIT_ATTEMPTS = 3
+_SCHEMA_RETRY_BASE_SECONDS = 0.05
 
 
 def runtime_db_path(cron_dir: Path) -> Path:
@@ -61,43 +65,94 @@ def _connect(cron_dir: Path) -> sqlite3.Connection:
     path = runtime_db_path(cron_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     owner = _owner_tuple(path) or _owner_tuple(path.parent)
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
-        from hermes_state import apply_wal_with_fallback
+    for attempt in range(_SCHEMA_INIT_ATTEMPTS):
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(path, timeout=5)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(conn, db_label="cron/runtime.db")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS job_runtime (
-                 job_id TEXT PRIMARY KEY,
-                 state_json TEXT NOT NULL
-               )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS pending_definitions (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                 definitions_json TEXT NOT NULL
-               )"""
-        )
-        conn.commit()
-        _secure_runtime_files(path, owner)
-        return conn
-    except BaseException:
-        if conn is not None:
-            conn.close()
-        raise
+            apply_wal_with_fallback(conn, db_label="cron/runtime.db")
+            conn.execute("PRAGMA synchronous=FULL")
+            # Serialize schema discovery and migration across gateway replicas.
+            # Without a write transaction, two first-openers can both observe the
+            # legacy shape and race the same ALTER TABLE statement.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS job_runtime (
+                     job_id TEXT PRIMARY KEY,
+                     state_json TEXT NOT NULL
+                   )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS pending_definitions (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     definitions_json TEXT NOT NULL,
+                     generation_id TEXT,
+                     base_definitions_digest TEXT
+                   )"""
+            )
+            pending_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(pending_definitions)"
+                ).fetchall()
+            }
+            if "generation_id" not in pending_columns:
+                conn.execute(
+                    "ALTER TABLE pending_definitions ADD COLUMN generation_id TEXT"
+                )
+            if "base_definitions_digest" not in pending_columns:
+                conn.execute(
+                    "ALTER TABLE pending_definitions "
+                    "ADD COLUMN base_definitions_digest TEXT"
+                )
+            conn.execute(
+                "UPDATE pending_definitions SET generation_id = ? "
+                "WHERE generation_id IS NULL OR generation_id = ''",
+                (uuid.uuid4().hex,),
+            )
+            conn.commit()
+            _secure_runtime_files(path, owner)
+            return conn
+        except BaseException as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                conn.close()
+            is_transient_lock = (
+                isinstance(exc, sqlite3.OperationalError)
+                and any(token in str(exc).lower() for token in ("locked", "busy"))
+            )
+            if not is_transient_lock or attempt + 1 >= _SCHEMA_INIT_ATTEMPTS:
+                raise
+            time.sleep(_SCHEMA_RETRY_BASE_SECONDS * (2**attempt))
+
+    raise RuntimeError("Cron runtime database initialization exhausted retries")
 
 
 @contextmanager
 def _transaction(cron_dir: Path) -> Iterator[sqlite3.Connection]:
-    """Open one transaction and close its connection deterministically."""
+    """Open one write transaction and close its connection deterministically.
+
+    ``BEGIN IMMEDIATE`` is required for expected-state fencing: sqlite3 does
+    not start a transaction for a plain ``SELECT``, so a deferred transaction
+    would leave a check-to-write window where a sibling could commit a newer
+    ownership row before this writer's upsert.
+    """
     conn = _connect(cron_dir)
     try:
-        with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
     finally:
         conn.close()
         owner = _owner_tuple(runtime_db_path(cron_dir)) or _owner_tuple(cron_dir)
@@ -151,6 +206,57 @@ def _replace_rows(
         )
 
 
+def _merge_rows(
+    conn: sqlite3.Connection,
+    states: Mapping[str, Mapping[str, Any]],
+    *,
+    removed_ids: Collection[str] = (),
+    expected_states: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> None:
+    """Upsert owned rows and delete only explicitly removed job IDs.
+
+    Ordinary cron writers may proceed after the advisory jobs lock times out.
+    Replacing the complete table in that degraded mode can erase a sibling
+    create that committed after this writer's snapshot. Targeted upserts retain
+    sibling rows while ``removed_ids`` preserves intentional-delete semantics.
+    """
+    normalized = {str(job_id): dict(state) for job_id, state in states.items()}
+    intended_remove = {str(job_id) for job_id in removed_ids if job_id}
+    if expected_states is not None:
+        expected = {
+            str(job_id): dict(state) for job_id, state in expected_states.items()
+        }
+        for job_id in set(normalized) | intended_remove:
+            row = conn.execute(
+                "SELECT state_json FROM job_runtime WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_id not in expected:
+                unchanged = row is None
+            else:
+                unchanged = (
+                    row is not None
+                    and _deserialize(job_id, row[0]) == expected[job_id]
+                )
+            if not unchanged:
+                raise RuntimeError(
+                    f"Cron runtime state for job {job_id!r} changed concurrently; "
+                    "refusing to overwrite the newer generation"
+                )
+    if normalized:
+        conn.executemany(
+            """INSERT INTO job_runtime(job_id, state_json) VALUES (?, ?)
+               ON CONFLICT(job_id) DO UPDATE
+               SET state_json=excluded.state_json""",
+            [(job_id, _serialize(state)) for job_id, state in normalized.items()],
+        )
+    if intended_remove:
+        conn.executemany(
+            "DELETE FROM job_runtime WHERE job_id = ?",
+            [(job_id,) for job_id in intended_remove],
+        )
+
+
 def load_runtime_states(cron_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Load all volatile job state for one profile."""
     path = runtime_db_path(cron_dir)
@@ -166,17 +272,20 @@ def load_runtime_states(cron_dir: Path) -> Dict[str, Dict[str, Any]]:
     }
 
 
-def load_pending_definitions(cron_dir: Path) -> Optional[list[Dict[str, Any]]]:
-    """Load a journaled definition snapshot awaiting materialization."""
+def load_pending_definition_record(
+    cron_dir: Path,
+) -> tuple[Optional[list[Dict[str, Any]]], Optional[str], Optional[str]]:
+    """Load a pending snapshot, acknowledgement token, and base digest."""
     path = runtime_db_path(cron_dir)
     if not path.exists():
-        return None
+        return None, None, None
     with _transaction(cron_dir) as conn:
         row = conn.execute(
-            "SELECT definitions_json FROM pending_definitions WHERE singleton = 1"
+            "SELECT definitions_json, generation_id, base_definitions_digest "
+            "FROM pending_definitions WHERE singleton = 1"
         ).fetchone()
     if row is None:
-        return None
+        return None, None, None
     try:
         definitions = json.loads(row["definitions_json"])
     except (TypeError, json.JSONDecodeError) as exc:
@@ -185,6 +294,24 @@ def load_pending_definitions(cron_dir: Path) -> Optional[list[Dict[str, Any]]]:
         isinstance(definition, dict) for definition in definitions
     ):
         raise RuntimeError("Cron pending definition journal must be a list of objects")
+    generation_id = str(row["generation_id"] or "").strip()
+    if not generation_id:
+        raise RuntimeError("Cron pending definition journal has no generation id")
+    base_digest = str(row["base_definitions_digest"] or "").strip() or None
+    return [dict(definition) for definition in definitions], generation_id, base_digest
+
+
+def load_pending_definition_generation(
+    cron_dir: Path,
+) -> tuple[Optional[list[Dict[str, Any]]], Optional[str]]:
+    """Load a pending definition snapshot and its acknowledgement token."""
+    definitions, generation_id, _base_digest = load_pending_definition_record(cron_dir)
+    return definitions, generation_id
+
+
+def load_pending_definitions(cron_dir: Path) -> Optional[list[Dict[str, Any]]]:
+    """Load a journaled definition snapshot awaiting materialization."""
+    definitions, _generation_id = load_pending_definition_generation(cron_dir)
     return definitions
 
 
@@ -229,10 +356,29 @@ def list_live_claims(
     return live
 
 
-def clear_pending_definitions(cron_dir: Path) -> None:
-    """Clear the forward-recovery journal after jobs.json is durable."""
+def clear_pending_definitions(
+    cron_dir: Path,
+    *,
+    expected_generation_id: Optional[str] = None,
+) -> bool:
+    """Acknowledge only the pending definition generation materialized by caller.
+
+    Omitting ``expected_generation_id`` is an explicit administrative clear.
+    Ordinary writers pass their generation token so an older materializer can
+    never erase a newer writer's forward-recovery journal.
+    """
     with _transaction(cron_dir) as conn:
-        conn.execute("DELETE FROM pending_definitions WHERE singleton = 1")
+        if expected_generation_id is None:
+            cursor = conn.execute(
+                "DELETE FROM pending_definitions WHERE singleton = 1"
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM pending_definitions "
+                "WHERE singleton = 1 AND generation_id = ?",
+                (expected_generation_id,),
+            )
+    return cursor.rowcount == 1
 
 
 def merge_legacy_runtime_states(
@@ -263,18 +409,58 @@ def replace_runtime_states(
         _replace_rows(conn, states)
 
 
+def merge_runtime_states(
+    cron_dir: Path,
+    states: Mapping[str, Mapping[str, Any]],
+    *,
+    removed_ids: Collection[str] = (),
+    expected_states: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> None:
+    """Atomically update owned runtime rows without erasing sibling writes."""
+    with _transaction(cron_dir) as conn:
+        _merge_rows(
+            conn,
+            states,
+            removed_ids=removed_ids,
+            expected_states=expected_states,
+        )
+
+
 def stage_runtime_and_definitions(
     cron_dir: Path,
     states: Mapping[str, Mapping[str, Any]],
     definitions: Sequence[Mapping[str, Any]],
-) -> None:
-    """Commit runtime plus a forward-recovery definition journal atomically."""
+    *,
+    removed_ids: Collection[str] = (),
+    replace: bool = True,
+    expected_states: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    base_definitions_digest: Optional[str] = None,
+) -> str:
+    """Commit runtime plus a generation-fenced recovery journal atomically."""
+    generation_id = uuid.uuid4().hex
     with _transaction(cron_dir) as conn:
-        _replace_rows(conn, states)
+        if replace:
+            _replace_rows(conn, states)
+        else:
+            _merge_rows(
+                conn,
+                states,
+                removed_ids=removed_ids,
+                expected_states=expected_states,
+            )
         conn.execute(
-            """INSERT INTO pending_definitions(singleton, definitions_json)
-               VALUES (1, ?)
-               ON CONFLICT(singleton) DO UPDATE
-               SET definitions_json=excluded.definitions_json""",
-            (_serialize_definitions(definitions),),
+            """INSERT INTO pending_definitions(
+                   singleton, definitions_json, generation_id,
+                   base_definitions_digest
+               ) VALUES (1, ?, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                   definitions_json=excluded.definitions_json,
+                   generation_id=excluded.generation_id,
+                   base_definitions_digest=excluded.base_definitions_digest""",
+            (
+                _serialize_definitions(definitions),
+                generation_id,
+                base_definitions_digest,
+            ),
         )
+    return generation_id

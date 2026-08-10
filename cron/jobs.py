@@ -35,16 +35,18 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
+from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from cron.runtime_state import (
     clear_pending_definitions,
+    load_pending_definition_record,
     load_pending_definitions,
     load_runtime_states,
     merge_legacy_runtime_states,
+    merge_runtime_states,
     replace_runtime_states,
     stage_runtime_and_definitions,
 )
@@ -318,6 +320,7 @@ def _jobs_lock(*, strict: bool = False):
         # section read it. Reset on entry/exit so stale stamps from unlocked
         # loads or prior sections can never suppress a needed merge.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.loaded_runtime_states = None
         _jobs_lock_state.cross_process_locked = False
         lock_fd = None
         cross_process_locked = False
@@ -420,6 +423,7 @@ def _jobs_lock(*, strict: bool = False):
                     lock_fd.close()
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.loaded_runtime_states = None
             _jobs_lock_state.cross_process_locked = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
@@ -503,6 +507,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    normalized.pop(_RUNTIME_OBSERVED_STATE, None)
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -1156,7 +1161,12 @@ _RUNTIME_JOB_FIELDS = frozenset({
     "runtime_tombstone",
     "monitor_state",
 })
-_EPHEMERAL_JOB_FIELDS = frozenset({"execution_id", "latest_execution"})
+_RUNTIME_OBSERVED_STATE = "_runtime_observed_state"
+_EPHEMERAL_JOB_FIELDS = frozenset({
+    "execution_id",
+    "latest_execution",
+    _RUNTIME_OBSERVED_STATE,
+})
 _RUNTIME_REPEAT_COMPLETED = "repeat_completed"
 _RUNTIME_DEFINITION_DIGEST = "_definition_digest"
 _RUNTIME_SCHEDULE_DIGEST = "_schedule_digest"
@@ -1185,6 +1195,25 @@ def _definition_digests(definition: Dict[str, Any]) -> Tuple[str, str]:
         "schedule": definition.get("schedule"),
     }
     return _canonical_digest(definition), _canonical_digest(cadence)
+
+
+def _default_runtime_state(definition: Dict[str, Any]) -> Dict[str, Any]:
+    """Build conservative runtime state for a definition with no durable row."""
+    enabled = bool(definition.get("enabled", True))
+    return {
+        "created_at": _hermes_now().isoformat(),
+        "state": "scheduled" if enabled else "paused",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "last_delivery_error": None,
+        "fire_claim": None,
+        "run_claim": None,
+        _RUNTIME_REPEAT_COMPLETED: 0,
+    }
 
 
 def _reconcile_runtime_state(
@@ -1435,6 +1464,7 @@ def _merge_job_record(
 ) -> Dict[str, Any]:
     """Overlay volatile state onto one definition for compatibility callers."""
     merged = copy.deepcopy(definition)
+    merged[_RUNTIME_OBSERVED_STATE] = copy.deepcopy(runtime or {})
     if not runtime:
         return merged
     state = copy.deepcopy(runtime)
@@ -1452,8 +1482,17 @@ def _write_job_definitions_unlocked(
     *,
     removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
-) -> None:
-    """Atomically write only declarative records. Caller holds _jobs_lock()."""
+    on_generation_change: Optional[
+        Callable[[List[Dict[str, Any]]], None]
+    ] = None,
+) -> List[Dict[str, Any]]:
+    """Atomically write declarative records and return the written generation.
+
+    ``on_generation_change`` lets the split-store save path restage runtime and
+    pending definitions when shrink-merge recovers a declaration after the
+    caller's initial SQLite transaction. This keeps the recovery journal bound
+    to the same generation that is ultimately materialized in jobs.json.
+    """
     jobs = definitions
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -1471,8 +1510,10 @@ def _write_job_definitions_unlocked(
         except OSError:
             _stat_before = None
 
-    # Shrink-merge + rewrite loop (#80624): under the degraded flock-timeout
-    # path another process can create a job between our load and our write.
+    # Shrink-merge + rewrite loop (#80624): defend against an artifact changing
+    # between our load and write (for example through a nested save or direct
+    # hand-deploy). Definition writes fail closed when the process lock is
+    # degraded, but this remains a second line of defense while the lock is held.
     # Merge unexpected disk ids into the payload, stage the write, then
     # re-peek; if new ids appeared, merge again and restage before replace.
     # The merge itself fast-paths to a single stat() when the enclosing
@@ -1481,7 +1522,14 @@ def _write_job_definitions_unlocked(
     try:
         for _attempt in range(5):
             if not replace:
-                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+                merged_jobs = _merge_unexpected_disk_jobs(
+                    jobs,
+                    removed_ids=removed_ids,
+                )
+                if merged_jobs != jobs:
+                    jobs = merged_jobs
+                    if on_generation_change is not None:
+                        on_generation_change(jobs)
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
             )
@@ -1547,11 +1595,18 @@ def _write_job_definitions_unlocked(
             # a degraded sibling landing between replace and stat. Later
             # saves in this section simply take the full merge (fail-safe).
             _record_load_stamp(None)
-            return
+            return jobs
 
         # Exhausted retries — last merge + write without another re-peek.
         if not replace:
-            jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+            merged_jobs = _merge_unexpected_disk_jobs(
+                jobs,
+                removed_ids=removed_ids,
+            )
+            if merged_jobs != jobs:
+                jobs = merged_jobs
+                if on_generation_change is not None:
+                    on_generation_change(jobs)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
         )
@@ -1568,6 +1623,8 @@ def _write_job_definitions_unlocked(
         tmp_path = None
         _secure_file(jobs_file)
         _preserve_file_ownership(jobs_file, _stat_before)
+        _record_load_stamp(None)
+        return jobs
     except BaseException:
         if tmp_path is not None:
             try:
@@ -1578,13 +1635,36 @@ def _write_job_definitions_unlocked(
 
 
 def _recover_pending_definitions_unlocked() -> None:
-    """Finish a journaled cross-store definition write, if one exists."""
+    """Finish only a journal proven to descend from the current artifact."""
     cron_dir = _current_cron_store().cron_dir
-    pending = load_pending_definitions(cron_dir)
-    if pending is None:
-        return
-    _write_job_definitions_unlocked(pending)
-    clear_pending_definitions(cron_dir)
+    for _attempt in range(8):
+        pending, generation_id, base_digest = load_pending_definition_record(cron_dir)
+        if pending is None or generation_id is None:
+            return
+        if not getattr(_jobs_lock_state, "cross_process_locked", False):
+            raise _JobsLockUnavailableError(
+                "Cron pending definition recovery requires the cross-process lock"
+            )
+
+        current_records, _needs_rewrite = _read_job_payload_unlocked()
+        current_definitions, _legacy_runtime = _partition_job_records(current_records)
+        current_digest = _canonical_digest(current_definitions)
+        pending_digest = _canonical_digest(pending)
+        if current_digest != pending_digest:
+            if base_digest is None or current_digest != base_digest:
+                raise RuntimeError(
+                    "Cron pending definition generation does not descend from "
+                    "the current jobs.json artifact; refusing stale exact replay"
+                )
+            _write_job_definitions_unlocked(pending, replace=True)
+        clear_pending_definitions(
+            cron_dir,
+            expected_generation_id=generation_id,
+        )
+    raise RuntimeError(
+        "Cron pending definitions kept changing during recovery; refusing to "
+        "acknowledge an unmaterialized generation"
+    )
 
 
 def load_jobs() -> List[Dict[str, Any]]:
@@ -1610,8 +1690,16 @@ def load_jobs() -> List[Dict[str, Any]]:
         raw_jobs, needs_rewrite = _read_job_payload_unlocked()
         definitions, legacy_runtime = _partition_job_records(raw_jobs)
         if legacy_runtime:
+            if not getattr(_jobs_lock_state, "cross_process_locked", False):
+                raise _JobsLockUnavailableError(
+                    "Cron legacy-store migration requires the cross-process lock"
+                )
             merge_legacy_runtime_states(cron_dir, legacy_runtime)
         if needs_rewrite or legacy_runtime:
+            if not getattr(_jobs_lock_state, "cross_process_locked", False):
+                raise _JobsLockUnavailableError(
+                    "Cron definition repair requires the cross-process lock"
+                )
             _write_job_definitions_unlocked(definitions)
             if needs_rewrite:
                 logger.warning("Auto-repaired jobs.json definition artifact")
@@ -1626,8 +1714,22 @@ def load_jobs() -> List[Dict[str, Any]]:
                 definition,
                 runtime_states.get(job_id, {}),
             )
-        if reconciled_states != runtime_states:
-            replace_runtime_states(cron_dir, reconciled_states)
+        if (
+            reconciled_states != runtime_states
+            and getattr(_jobs_lock_state, "cross_process_locked", False)
+        ):
+            # Under the authoritative lock, jobs.json is the complete definition
+            # set. Prune rows for hand-deployed deletions while reconciling rows
+            # still represented by the artifact.
+            merge_runtime_states(
+                cron_dir,
+                reconciled_states,
+                removed_ids=set(runtime_states) - set(reconciled_states),
+                expected_states=runtime_states,
+            )
+
+        if getattr(_jobs_lock_state, "depth", 0):
+            _jobs_lock_state.loaded_runtime_states = copy.deepcopy(reconciled_states)
 
         return [
             _merge_job_record(
@@ -1656,7 +1758,17 @@ def _save_jobs_unlocked(
     replace: bool = False,
 ) -> None:
     """Persist definitions and runtime separately. Caller holds _jobs_lock()."""
-    _recover_pending_definitions_unlocked()
+    if not replace:
+        _recover_pending_definitions_unlocked()
+    supplied_observed_runtime = {
+        str(job.get("id") or ""): copy.deepcopy(job[_RUNTIME_OBSERVED_STATE])
+        for job in jobs
+        if job.get("id")
+        and isinstance(job.get(_RUNTIME_OBSERVED_STATE), dict)
+    }
+    loaded_runtime_snapshot = copy.deepcopy(
+        getattr(_jobs_lock_state, "loaded_runtime_states", None) or {}
+    )
     definitions, supplied_runtime = _partition_job_records(jobs)
     if not replace:
         definitions = _merge_unexpected_disk_jobs(
@@ -1664,49 +1776,210 @@ def _save_jobs_unlocked(
             removed_ids=removed_ids,
         )
     cron_dir = _current_cron_store().cron_dir
-    existing_runtime = load_runtime_states(cron_dir)
-    reconciled_states: Dict[str, Dict[str, Any]] = {}
 
-    for definition in definitions:
-        job_id = str(definition.get("id") or "")
-        if not job_id:
-            continue
-        provided = supplied_runtime.get(job_id)
-        if provided is None:
-            candidate = existing_runtime.get(job_id, {})
-            supplied_fields: Set[str] = set()
+    def _reconcile_generation(
+        generation: List[Dict[str, Any]],
+        *,
+        expected_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Return caller-observed expectations and desired runtime state."""
+        existing_runtime = {} if replace else load_runtime_states(cron_dir)
+        expected: Dict[str, Dict[str, Any]] = {}
+        reconciled: Dict[str, Dict[str, Any]] = {}
+        for definition in generation:
+            job_id = str(definition.get("id") or "")
+            if not job_id:
+                continue
+            current = existing_runtime.get(job_id)
+            provided = supplied_runtime.get(job_id)
+            if provided is None:
+                candidate = (
+                    current
+                    if current is not None
+                    else _default_runtime_state(definition)
+                )
+                supplied_fields: Set[str] = set()
+            else:
+                observed_base = supplied_observed_runtime.get(job_id)
+                if observed_base is not None:
+                    candidate = copy.deepcopy(observed_base)
+                    # A compatibility record loaded from this store exposes
+                    # every persisted public runtime field. If its caller
+                    # removes one (for example ``preflight_alerted`` after the
+                    # configuration heals), that absence is an intentional
+                    # deletion rather than permission to resurrect the value
+                    # from the observed CAS snapshot. Internal digest fields
+                    # are not public and remain preserved.
+                    for runtime_field in _RUNTIME_JOB_FIELDS:
+                        if runtime_field not in provided:
+                            candidate.pop(runtime_field, None)
+                else:
+                    candidate = {
+                        key: value
+                        for key, value in (current or {}).items()
+                        if key in {
+                            _RUNTIME_DEFINITION_DIGEST,
+                            _RUNTIME_SCHEDULE_DIGEST,
+                        }
+                    }
+                candidate.update(provided)
+                supplied_fields = set(provided)
+
+            if not replace and current is not None:
+                if expected_overrides is not None and job_id in expected_overrides:
+                    expected[job_id] = copy.deepcopy(expected_overrides[job_id])
+                elif provided is None:
+                    expected[job_id] = copy.deepcopy(current)
+                elif job_id in supplied_observed_runtime:
+                    expected[job_id] = copy.deepcopy(
+                        supplied_observed_runtime[job_id]
+                    )
+                elif any(
+                    current.get(claim_field) != provided.get(claim_field)
+                    for claim_field in ("fire_claim", "run_claim")
+                    if isinstance(current.get(claim_field), dict)
+                    or isinstance(provided.get(claim_field), dict)
+                ):
+                    raise RuntimeError(
+                        f"Cron runtime ownership for job {job_id!r} changed "
+                        "concurrently; refusing an unfenced claim overwrite"
+                    )
+                elif all(current.get(key) == value for key, value in provided.items()):
+                    # Definitions-only/manual compatibility payload: it is safe
+                    # when its supplied runtime already matches the live row.
+                    expected[job_id] = copy.deepcopy(current)
+                else:
+                    raise RuntimeError(
+                        f"Cron runtime state for job {job_id!r} has no caller "
+                        "generation; refusing an unfenced runtime overwrite"
+                    )
+            reconciled[job_id] = _reconcile_runtime_state(
+                definition,
+                candidate,
+                provided_fields=supplied_fields,
+            )
+        for removed_id in {str(item) for item in removed_ids or () if item}:
+            if replace or removed_id not in existing_runtime:
+                continue
+            if expected_overrides is not None and removed_id in expected_overrides:
+                expected[removed_id] = copy.deepcopy(expected_overrides[removed_id])
+            elif removed_id in loaded_runtime_snapshot:
+                expected[removed_id] = copy.deepcopy(
+                    loaded_runtime_snapshot[removed_id]
+                )
+            else:
+                current = existing_runtime[removed_id]
+                if isinstance(current.get("fire_claim"), dict) or isinstance(
+                    current.get("run_claim"), dict
+                ):
+                    raise RuntimeError(
+                        f"Cron runtime state for job {removed_id!r} has active "
+                        "ownership and no caller generation; refusing deletion"
+                    )
+                expected[removed_id] = copy.deepcopy(current)
+        return expected, reconciled
+
+    expected_states, reconciled_states = _reconcile_generation(definitions)
+    if replace:
+        # Explicit disaster recovery may replace a corrupt artifact without
+        # deserializing it. When the current artifact is readable, still bind
+        # the staged journal to that exact base so an interrupted replacement
+        # can roll forward safely. An unreadable base remains deliberately
+        # unproven and requires the operator to rerun the idempotent recovery.
+        current = _peek_jobs_unlocked()
+        if current is None:
+            base_definitions_digest = None
         else:
-            candidate = {
-                key: value
-                for key, value in existing_runtime.get(job_id, {}).items()
-                if key in {_RUNTIME_DEFINITION_DIGEST, _RUNTIME_SCHEDULE_DIGEST}
-            }
-            candidate.update(provided)
-            supplied_fields = set(provided)
-        reconciled_states[job_id] = _reconcile_runtime_state(
-            definition,
-            candidate,
-            provided_fields=supplied_fields,
+            current_definitions, _legacy_runtime = _partition_job_records(current)
+            base_definitions_digest = _canonical_digest(current_definitions)
+        definition_changed = True
+    else:
+        current, needs_rewrite = _read_job_payload_unlocked()
+        current_definitions, legacy_runtime = _partition_job_records(current)
+        base_definitions_digest = _canonical_digest(current_definitions)
+        definition_changed = bool(
+            needs_rewrite or legacy_runtime or current_definitions != definitions
+        )
+    if not definition_changed:
+        # Close the load→runtime-only-write window. If the artifact changed
+        # after the read, turn this into a paired-generation write while the
+        # process lock is healthy, or fail closed below in degraded mode.
+        if not replace:
+            verified_definitions = _merge_unexpected_disk_jobs(
+                definitions,
+                removed_ids=removed_ids,
+            )
+            if verified_definitions != definitions:
+                definitions = verified_definitions
+                expected_states, reconciled_states = _reconcile_generation(
+                    definitions
+                )
+                definition_changed = True
+        if not definition_changed:
+            if replace:
+                replace_runtime_states(cron_dir, reconciled_states)
+            else:
+                merge_runtime_states(
+                    cron_dir,
+                    reconciled_states,
+                    removed_ids=removed_ids or (),
+                    expected_states=expected_states,
+                )
+            return
+
+    if not getattr(_jobs_lock_state, "cross_process_locked", False):
+        raise _JobsLockUnavailableError(
+            "Cron definition writes require the cross-process lock"
         )
 
-    current, needs_rewrite = _read_job_payload_unlocked()
-    current_definitions, legacy_runtime = _partition_job_records(current)
-    definition_changed = bool(
-        needs_rewrite or legacy_runtime or current_definitions != definitions
-    )
-    if not definition_changed:
-        replace_runtime_states(cron_dir, reconciled_states)
-        return
+    pending_generation_id: Optional[str] = None
+    staged_states: Dict[str, Dict[str, Any]] = copy.deepcopy(reconciled_states)
+
+    def _stage_generation(generation: List[Dict[str, Any]]) -> None:
+        """Journal a shrink-merged generation before jobs.json can publish it."""
+        nonlocal pending_generation_id, staged_states
+        current_records, _needs_rewrite = _read_job_payload_unlocked()
+        current_definitions, _legacy_runtime = _partition_job_records(current_records)
+        expected, staged = _reconcile_generation(
+            generation,
+            expected_overrides=staged_states,
+        )
+        pending_generation_id = stage_runtime_and_definitions(
+            cron_dir,
+            staged,
+            generation,
+            removed_ids=removed_ids or (),
+            replace=replace,
+            expected_states=expected,
+            base_definitions_digest=_canonical_digest(current_definitions),
+        )
+        staged_states = copy.deepcopy(staged)
 
     # Runtime and the desired definitions commit together in SQLite first. The
     # next load can finish an interrupted jobs.json materialization idempotently.
-    stage_runtime_and_definitions(cron_dir, reconciled_states, definitions)
+    pending_generation_id = stage_runtime_and_definitions(
+        cron_dir,
+        reconciled_states,
+        definitions,
+        removed_ids=removed_ids or (),
+        replace=replace,
+        expected_states=expected_states,
+        base_definitions_digest=base_definitions_digest,
+    )
     _write_job_definitions_unlocked(
         definitions,
         removed_ids=removed_ids,
         replace=replace,
+        on_generation_change=_stage_generation,
     )
-    clear_pending_definitions(cron_dir)
+    if not clear_pending_definitions(
+        cron_dir,
+        expected_generation_id=pending_generation_id,
+    ):
+        # A sibling staged a newer generation while this one materialized. Its
+        # journal remains authoritative; roll it forward instead of returning
+        # with jobs.json bound to an older generation.
+        _recover_pending_definitions_unlocked()
 
 
 def save_jobs(
@@ -1717,9 +1990,9 @@ def save_jobs(
 ):
     """Save jobs while keeping volatile state out of jobs.json.
 
-    ``removed_ids`` lists intentional deletes so the degraded-lock
-    shrink-merge does not restore them. ``replace=True`` requests an exact
-    wholesale rewrite (tests and disaster recovery).
+    ``removed_ids`` lists intentional deletes so defensive shrink-merge does
+    not restore them. ``replace=True`` requests an exact wholesale rewrite
+    (tests and disaster recovery); neither mode bypasses the process lock.
     """
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)

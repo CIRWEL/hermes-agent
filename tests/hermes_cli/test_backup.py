@@ -1066,6 +1066,17 @@ class TestQuickSnapshot:
         ) is True
         monkeypatch.setattr(backup_mod.os, "replace", original_replace)
 
+        from cron.runtime_state import load_pending_definition_record
+
+        pending, generation_id, base_digest = load_pending_definition_record(
+            hermes_home / "cron"
+        )
+        assert pending is not None
+        assert generation_id
+        live_records = json.loads(jobs_path.read_text())["jobs"]
+        live_definitions, _runtime = jobs._partition_job_records(live_records)
+        assert base_digest == jobs._canonical_digest(live_definitions)
+
         with jobs.use_cron_store(hermes_home):
             recovered = jobs.get_job(created["id"])
         assert recovered is not None
@@ -1087,6 +1098,7 @@ class TestQuickSnapshot:
                 deliver="local",
             )
             definitions = jobs.export_job_definitions()
+            base_definitions_digest = jobs._canonical_digest(definitions)
             for definition in definitions:
                 if definition["id"] == created["id"]:
                     definition["prompt"] = "generation-one"
@@ -1094,6 +1106,7 @@ class TestQuickSnapshot:
                 hermes_home / "cron",
                 load_runtime_states(hermes_home / "cron"),
                 definitions,
+                base_definitions_digest=base_definitions_digest,
             )
 
         snap_id = backup_mod.create_quick_snapshot(hermes_home=hermes_home)
@@ -1109,6 +1122,46 @@ class TestQuickSnapshot:
 
         snap_job = next(job for job in snap_jobs if job["id"] == created["id"])
         assert snap_job["prompt"] == "generation-one"
+
+    def test_snapshot_rejects_stale_pending_definition_ancestry(self, hermes_home):
+        """A stale A-only journal cannot produce a successful A-only backup."""
+        from cron import jobs
+        from cron.runtime_state import (
+            load_runtime_states,
+            stage_runtime_and_definitions,
+        )
+        from hermes_cli import backup as backup_mod
+
+        with jobs.use_cron_store(hermes_home):
+            first = jobs.create_job(
+                prompt="first",
+                schedule="every 1h",
+                deliver="local",
+            )
+            stale_definitions = jobs.export_job_definitions()
+            stale_base_digest = jobs._canonical_digest(stale_definitions)
+            second = jobs.create_job(
+                prompt="second",
+                schedule="every 2h",
+                deliver="local",
+            )
+            stage_runtime_and_definitions(
+                hermes_home / "cron",
+                load_runtime_states(hermes_home / "cron"),
+                stale_definitions,
+                base_definitions_digest=stale_base_digest,
+            )
+
+        snap_id = backup_mod.create_quick_snapshot(hermes_home=hermes_home)
+        assert snap_id is not None
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        manifest = json.loads((snap_dir / "manifest.json").read_text())["files"]
+
+        assert first["id"] != second["id"]
+        assert "cron/jobs.json" not in manifest
+        assert "cron/runtime.db" not in manifest
+        assert not (snap_dir / "cron" / "jobs.json").exists()
+        assert not (snap_dir / "cron" / "runtime.db").exists()
 
     def test_restore_refuses_one_sided_cron_pair(self, hermes_home):
         """A partial manifest must never replace only definitions or runtime."""

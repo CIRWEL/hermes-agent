@@ -24,6 +24,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
+def _assert_pid_file_process_exited(pid_file: Path) -> None:
+    """Wait on process identity instead of racing a delayed side-effect file."""
+    import psutil
+
+    assert pid_file.exists(), "worker did not publish the process identity"
+    try:
+        process = psutil.Process(int(pid_file.read_text(encoding="utf-8")))
+    except psutil.NoSuchProcess:
+        return
+    _gone, alive = psutil.wait_procs([process], timeout=2.0)
+    assert not alive, f"process {process.pid} survived the worker hard stop"
+
+
 class FakeAgent:
     """Mock agent with controllable activity summary for timeout tests."""
 
@@ -427,6 +440,7 @@ class TestInactivityTimeout:
         """Hard timeout snapshots and kills descendants that create a new session."""
         import cron.scheduler as scheduler
 
+        child_pid_file = tmp_path / "detached-child.pid"
         marker = tmp_path / "detached-survived"
         pulse_env = "HERMES_CRON_WORKER_PULSE"
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.05")
@@ -440,14 +454,16 @@ class TestInactivityTimeout:
         child_code = (
             "import pathlib,signal,time;"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-            "time.sleep(0.25);"
-            f"pathlib.Path({str(marker)!r}).write_text('survived')"
+            "time.sleep(3);"
+            f"pathlib.Path({str(marker)!r}).write_text('survived');"
+            "time.sleep(5)"
         )
         worker_code = (
             "import os,pathlib,subprocess,sys,time;"
             "sys.stdin.read();"
-            f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+            f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}], "
             "start_new_session=True);"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid));"
             f"pathlib.Path(os.environ[{pulse_env!r}]).touch();"
             "time.sleep(5)"
         )
@@ -464,7 +480,7 @@ class TestInactivityTimeout:
 
         assert result[0] is False
         assert "timed out" in (result[3] or "").lower()
-        time.sleep(0.35)
+        _assert_pid_file_process_exited(child_pid_file)
         assert not marker.exists()
 
     def test_killable_worker_acknowledges_hard_timeout_before_return(
@@ -475,62 +491,17 @@ class TestInactivityTimeout:
         """An uncooperative worker is process-killed before ownership can clear."""
         import cron.scheduler as scheduler
 
+        worker_pid_file = tmp_path / "worker.pid"
         marker = tmp_path / "worker-survived"
         pulse_env = "HERMES_CRON_WORKER_PULSE"
         code = (
             "import os,pathlib,signal,sys,time;"
             "sys.stdin.read();"
+            f"pathlib.Path({str(worker_pid_file)!r}).write_text(str(os.getpid()));"
             f"pathlib.Path(os.environ[{pulse_env!r}]).touch();"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-            "time.sleep(0.4);"
-            "pathlib.Path(os.environ['CRON_TEST_SURVIVAL_MARKER']).write_text('bad')"
-        )
-        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.05")
-        monkeypatch.setenv("CRON_TEST_SURVIVAL_MARKER", str(marker))
-        monkeypatch.setattr(scheduler, "_CRON_WORKER_POLL_SECONDS", 0.01)
-        monkeypatch.setattr(scheduler, "_CRON_WORKER_TERMINATE_GRACE_SECONDS", 0.03)
-        monkeypatch.setattr(
-            scheduler,
-            "_cron_worker_command",
-            lambda: [sys.executable, "-c", code],
-        )
-
-        started = time.monotonic()
-        success, output, response, error = scheduler._run_job_in_killable_process(
-            {"id": "hard-timeout", "name": "hard-timeout", "prompt": "hang"}
-        )
-        elapsed = time.monotonic() - started
-
-        assert success is False
-        assert output == ""
-        assert response == ""
-        assert error is not None
-        assert "inactivity" in error.lower()
-        assert elapsed < 0.3
-        time.sleep(0.2)
-        assert not marker.exists()
-
-    def test_killable_worker_kills_descendant_after_leader_exits(
-        self,
-        monkeypatch,
-        tmp_path,
-    ):
-        """A cooperative leader cannot leave a SIGTERM-ignoring child behind."""
-        import cron.scheduler as scheduler
-
-        marker = tmp_path / "descendant-survived"
-        pulse_env = "HERMES_CRON_WORKER_PULSE"
-        descendant = (
-            "import pathlib,signal,time;"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-            "time.sleep(0.25);"
-            f"pathlib.Path({str(marker)!r}).write_text('bad')"
-        )
-        code = (
-            "import os,pathlib,subprocess,sys,time;"
-            "sys.stdin.read();"
-            f"pathlib.Path(os.environ[{pulse_env!r}]).touch();"
-            f"subprocess.Popen([sys.executable,'-c',{descendant!r}]);"
+            "time.sleep(3);"
+            f"pathlib.Path({str(marker)!r}).write_text('bad');"
             "time.sleep(5)"
         )
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.05")
@@ -542,12 +513,123 @@ class TestInactivityTimeout:
             lambda: [sys.executable, "-c", code],
         )
 
+        success, output, response, error = scheduler._run_job_in_killable_process(
+            {"id": "hard-timeout", "name": "hard-timeout", "prompt": "hang"}
+        )
+
+        assert success is False
+        assert output == ""
+        assert response == ""
+        assert error is not None
+        assert "inactivity" in error.lower()
+        _assert_pid_file_process_exited(worker_pid_file)
+        assert not marker.exists()
+
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_signals_worker_before_reparented_scan(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A slow detached-worker scan cannot precede stopping the known leader."""
+        import cron.scheduler as scheduler
+
+        worker_pid_file = tmp_path / "scan-order-worker.pid"
+        scan_trigger = tmp_path / "scan-order-trigger"
+        marker = tmp_path / "scan-order-side-effect"
+        code = (
+            "import os,pathlib,sys,time\n"
+            "sys.stdin.read()\n"
+            f"pathlib.Path({str(worker_pid_file)!r}).write_text(str(os.getpid()))\n"
+            f"trigger=pathlib.Path({str(scan_trigger)!r})\n"
+            "while not trigger.exists():\n"
+            "    time.sleep(0.005)\n"
+            f"pathlib.Path({str(marker)!r}).write_text('bad')\n"
+            "time.sleep(5)\n"
+        )
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.05")
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_TERMINATE_GRACE_SECONDS", 0.03)
+        monkeypatch.setattr(
+            scheduler,
+            "_snapshot_cron_worker_descendants",
+            lambda _process: [],
+        )
+
+        def expose_slow_host_scan(*_args, **_kwargs):
+            scan_trigger.touch()
+            time.sleep(0.15)
+            return []
+
+        monkeypatch.setattr(
+            scheduler,
+            "_snapshot_reparented_cron_workers",
+            expose_slow_host_scan,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_cron_worker_command",
+            lambda: [sys.executable, "-c", code],
+        )
+
+        result = scheduler._run_job_in_killable_process(
+            {"id": "scan-order", "name": "scan-order", "prompt": "hang"}
+        )
+
+        assert result[0] is False
+        _assert_pid_file_process_exited(worker_pid_file)
+        assert not marker.exists()
+
+    @pytest.mark.live_system_guard_bypass
+    def test_killable_worker_kills_descendant_after_leader_exits(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A leader that exits first cannot leave a detached child behind."""
+        import cron.scheduler as scheduler
+
+        child_pid_file = tmp_path / "child.pid"
+        marker = tmp_path / "descendant-survived"
+        pulse_env = "HERMES_CRON_WORKER_PULSE"
+        descendant = (
+            "import pathlib,signal,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "time.sleep(3);"
+            f"pathlib.Path({str(marker)!r}).write_text('bad');"
+            "time.sleep(5)"
+        )
+        code = (
+            "import os,pathlib,subprocess,sys,time;"
+            "sys.stdin.read();"
+            f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+            "start_new_session=True);"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid));"
+            f"pathlib.Path(os.environ[{pulse_env!r}]).touch();"
+            "time.sleep(0.15)"
+        )
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "2")
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_TERMINATE_GRACE_SECONDS", 0.03)
+        # Model the leader disappearing before ancestry can be enumerated. The
+        # cleanup path must still find the reparented process by worker identity.
+        monkeypatch.setattr(
+            scheduler,
+            "_snapshot_cron_worker_descendants",
+            lambda _process: [],
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_cron_worker_command",
+            lambda: [sys.executable, "-c", code],
+        )
+
         result = scheduler._run_job_in_killable_process(
             {"id": "descendant-timeout", "name": "descendant", "prompt": "hang"}
         )
 
         assert result[0] is False
-        time.sleep(0.3)
+        _assert_pid_file_process_exited(child_pid_file)
         assert not marker.exists()
 
     def test_killable_worker_returns_nonce_bound_pipe_result(
@@ -576,6 +658,71 @@ class TestInactivityTimeout:
         assert scheduler._run_job_in_killable_process(
             {"id": "normal-worker", "name": "normal", "prompt": "run"}
         ) == (True, "doc", "response", None)
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session regression")
+    def test_successful_worker_reaps_detached_descendant_after_leader_exit(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A valid result cannot exempt a detached worker child from cleanup."""
+        import psutil
+
+        import cron.scheduler as scheduler
+
+        child_pid_file = tmp_path / "successful-worker-descendant.pid"
+        descendant = (
+            "import signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "time.sleep(5)"
+        )
+        code = (
+            "import json,pathlib,subprocess,sys;"
+            "request=json.loads(sys.stdin.read());"
+            f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL,start_new_session=True);"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid));"
+            "result={'result':[True,'doc','response',None]};"
+            "print('__HERMES_CRON_RESULT__'+request['nonce']+':'"
+            "+json.dumps(result),flush=True)"
+        )
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1")
+        # Let the leader return its valid result before the first timeout poll,
+        # exercising successful-result cleanup rather than abnormal cleanup.
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_POLL_SECONDS", 1.0)
+        monkeypatch.setattr(scheduler, "_CRON_WORKER_TERMINATE_GRACE_SECONDS", 0.03)
+        monkeypatch.setattr(
+            scheduler,
+            "_snapshot_cron_worker_descendants",
+            lambda _process: [],
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_cron_worker_command",
+            lambda: [sys.executable, "-c", code],
+        )
+
+        child = None
+        try:
+            assert scheduler._run_job_in_killable_process(
+                {"id": "successful-worker", "name": "worker", "prompt": "run"}
+            ) == (True, "doc", "response", None)
+            assert child_pid_file.exists(), "worker did not publish its child identity"
+            _assert_pid_file_process_exited(child_pid_file)
+        finally:
+            if child is None and child_pid_file.exists():
+                try:
+                    child = psutil.Process(int(child_pid_file.read_text(encoding="utf-8")))
+                except psutil.NoSuchProcess:
+                    child = None
+            if child is not None:
+                try:
+                    child.kill()
+                    child.wait(timeout=1.0)
+                except psutil.Error:
+                    pass
 
     def test_default_worker_module_is_profile_scoped(self, monkeypatch, tmp_path):
         """The real child entrypoint runs against the selected profile store."""

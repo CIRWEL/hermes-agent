@@ -826,7 +826,8 @@ class TestCompletedJobManagement:
         )
         job_id = created["job_id"]
 
-        def _fake_execute(job):
+        def _fake_execute(job, *, extra_prompt=None):
+            assert extra_prompt is None
             assert mark_job_run(job["id"], success=True) is True
             return {"claimed": True, "success": True, "error": None}
 

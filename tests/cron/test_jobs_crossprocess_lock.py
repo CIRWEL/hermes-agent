@@ -169,3 +169,35 @@ def test_nested_strict_jobs_lock_rejects_degraded_outer_lock(tmp_path, monkeypat
         with pytest.raises(jobs._JobsLockUnavailableError, match="degraded mode"):
             with jobs._jobs_lock(strict=True):
                 pytest.fail("nested strict lock entered degraded mode")
+
+
+@pytest.mark.skipif(jobs.fcntl is None, reason="POSIX fcntl/flock required")
+@pytest.mark.parametrize("replace", [False, True])
+def test_definition_writes_fail_closed_without_cross_process_lock(
+    tmp_path, monkeypatch, replace
+):
+    """Neither ordinary nor recovery-authorized saves may race without the lock."""
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    created = jobs.create_job(prompt="before", schedule="every 1h")
+    definitions = jobs.export_job_definitions()
+    definitions[0]["prompt"] = "must not land"
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.0)
+
+    real_flock = jobs.fcntl.flock
+
+    def busy_flock(fd, operation):
+        if operation & jobs.fcntl.LOCK_NB:
+            raise BlockingIOError("held by another process")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(jobs.fcntl, "flock", busy_flock)
+
+    with pytest.raises(jobs._JobsLockUnavailableError, match="cross-process lock"):
+        jobs.save_jobs(definitions, replace=replace)
+
+    persisted = jobs.JOBS_FILE.read_text(encoding="utf-8")
+    assert "must not land" not in persisted
+    assert created["id"] in persisted

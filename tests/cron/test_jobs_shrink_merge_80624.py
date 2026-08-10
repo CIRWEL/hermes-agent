@@ -201,17 +201,46 @@ def test_merge_does_not_mutate_caller_list(hermes_env):
     assert my_payload == [], "caller's list was mutated in place by the merge"
 
 
-def test_corrupt_disk_file_does_not_break_save(hermes_env):
-    """A corrupt jobs.json under a save must not recurse or crash: the
-    non-repairing peek returns None and the save overwrites cleanly."""
+def test_corrupt_disk_file_requires_explicit_replacement(hermes_env):
+    """Ordinary saves fail closed; explicit recovery may replace corruption."""
     import cron.jobs as jobs
     from cron.jobs import load_jobs, save_jobs
 
     jobs.ensure_dirs()
     jobs_file = jobs._current_cron_store().jobs_file
-    jobs_file.write_text('{"jobs": [{"id": "ccc', encoding="utf-8")
-    save_jobs([{"id": "aaaaaaaaaaaa", "name": "a"}])
+    corrupt = b'{"jobs": [{"id": "ccc'
+    jobs_file.write_bytes(corrupt)
+
+    with pytest.raises(RuntimeError, match="corrupted"):
+        save_jobs([{"id": "aaaaaaaaaaaa", "name": "a"}])
+    assert jobs_file.read_bytes() == corrupt
+
+    save_jobs([{"id": "aaaaaaaaaaaa", "name": "a"}], replace=True)
     assert [j["id"] for j in load_jobs()] == ["aaaaaaaaaaaa"]
+
+
+def test_transient_read_failure_never_authorizes_ordinary_overwrite(
+    hermes_env,
+    monkeypatch,
+):
+    """A temporary read error must preserve the last durable artifact."""
+    import cron.jobs as jobs
+    from cron.jobs import save_jobs
+
+    seed = {"id": "aaaaaaaaaaaa", "name": "a"}
+    save_jobs([seed], replace=True)
+    jobs_file = jobs._current_cron_store().jobs_file
+    before = jobs_file.read_bytes()
+
+    monkeypatch.setattr(
+        jobs,
+        "_parse_jobs_file",
+        lambda _path: (_ for _ in ()).throw(IOError("temporary read failure")),
+    )
+    with pytest.raises(RuntimeError, match="Failed to read cron database"):
+        save_jobs([{"id": "bbbbbbbbbbbb", "name": "stale"}])
+
+    assert jobs_file.read_bytes() == before
 
 
 def test_nested_create_survives_outer_stale_save(hermes_env):

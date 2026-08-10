@@ -9,6 +9,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _assert_process_exited(pid_file) -> None:
+    """Assert by process identity rather than a delayed negative side effect."""
+    import psutil
+
+    assert pid_file.exists(), "script did not publish its process identity"
+    try:
+        process = psutil.Process(int(pid_file.read_text(encoding="utf-8")))
+    except psutil.NoSuchProcess:
+        return
+    _gone, alive = psutil.wait_procs([process], timeout=2.0)
+    assert not alive, f"script process {process.pid} survived termination"
+
+
 @pytest.mark.parametrize(
     ("no_agent", "script_output"),
     [
@@ -212,18 +225,42 @@ def test_fire_claim_loss_terminates_running_script(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     scripts = home / "scripts"
     scripts.mkdir(parents=True)
+    pid_file = tmp_path / "slow.pid"
     late_effect = tmp_path / "late-effect"
+    scan_trigger = tmp_path / "scan-trigger"
     script = scripts / "slow.py"
     script.write_text(
-        "import pathlib, time\n"
-        "time.sleep(1)\n"
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        f"trigger = pathlib.Path({str(scan_trigger)!r})\n"
+        "while not trigger.exists():\n"
+        "    time.sleep(0.005)\n"
         f"pathlib.Path({str(late_effect)!r}).write_text('stale side effect')\n"
+        "time.sleep(5)\n"
     )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *a, **k: False)
 
-    started = time.monotonic()
+    def _lose_claim_after_script_starts(*_args, **_kwargs) -> bool:
+        deadline = time.monotonic() + 2.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pid_file.exists(), "script never published its process identity"
+        return False
+
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _lose_claim_after_script_starts)
+
+    def expose_slow_host_scan(*_args, **_kwargs):
+        scan_trigger.touch()
+        time.sleep(0.15)
+        return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "_snapshot_reparented_cron_workers",
+        expose_slow_host_scan,
+    )
+
     success, output = scheduler._run_job_script_with_claim_heartbeat(
         {
             "id": "lost-script-owner",
@@ -232,12 +269,10 @@ def test_fire_claim_loss_terminates_running_script(tmp_path, monkeypatch):
         },
         "slow.py",
     )
-    elapsed = time.monotonic() - started
 
     assert success is False
     assert "ownership" in output.lower()
-    assert elapsed < 0.5
-    time.sleep(1.0)
+    _assert_process_exited(pid_file)
     assert not late_effect.exists()
 
 
@@ -252,6 +287,16 @@ def test_running_claimed_script_refreshes_parent_worker_pulse(tmp_path, monkeypa
     pulse = tmp_path / "script.pulse"
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.setenv(scheduler._CRON_WORKER_PULSE_ENV, str(pulse))
+
+    def observe_after_leader_exit(process):
+        process.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "_snapshot_cron_worker_descendants",
+        observe_after_leader_exit,
+    )
 
     result = scheduler._run_job_script(
         "slow.py",
@@ -269,16 +314,19 @@ def test_claimed_script_timeout_kills_descendants(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     scripts = home / "scripts"
     scripts.mkdir(parents=True)
+    child_pid_file = tmp_path / "script-descendant.pid"
     marker = tmp_path / "script-descendant-survived"
     descendant = (
         "import pathlib,signal,time;"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-        "time.sleep(1.4);"
-        f"pathlib.Path({str(marker)!r}).write_text('bad')"
+        "time.sleep(3);"
+        f"pathlib.Path({str(marker)!r}).write_text('bad');"
+        "time.sleep(5)"
     )
     (scripts / "timeout.py").write_text(
-        "import subprocess,sys,time\n"
-        f"subprocess.Popen([sys.executable, '-c', {descendant!r}])\n"
+        "import pathlib,subprocess,sys,time\n"
+        f"child=subprocess.Popen([sys.executable, '-c', {descendant!r}])\n"
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
         "time.sleep(5)\n"
     )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
@@ -292,7 +340,7 @@ def test_claimed_script_timeout_kills_descendants(tmp_path, monkeypatch):
 
     assert success is False
     assert "timed out" in output.lower()
-    time.sleep(0.5)
+    _assert_process_exited(child_pid_file)
     assert not marker.exists()
 
 
@@ -305,17 +353,20 @@ def test_claimed_script_timeout_kills_detached_descendants(tmp_path, monkeypatch
     home = tmp_path / "profile"
     scripts = home / "scripts"
     scripts.mkdir(parents=True)
+    child_pid_file = tmp_path / "detached-script-descendant.pid"
     marker = tmp_path / "detached-script-descendant-survived"
     descendant = (
         "import pathlib,signal,time;"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-        "time.sleep(1.4);"
-        f"pathlib.Path({str(marker)!r}).write_text('bad')"
+        "time.sleep(3);"
+        f"pathlib.Path({str(marker)!r}).write_text('bad');"
+        "time.sleep(5)"
     )
     (scripts / "detached-timeout.py").write_text(
-        "import subprocess,sys,time\n"
-        f"subprocess.Popen([sys.executable, '-c', {descendant!r}], "
+        "import pathlib,subprocess,sys,time\n"
+        f"child=subprocess.Popen([sys.executable, '-c', {descendant!r}], "
         "start_new_session=True)\n"
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
         "time.sleep(5)\n"
     )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
@@ -333,5 +384,69 @@ def test_claimed_script_timeout_kills_detached_descendants(tmp_path, monkeypatch
 
     assert success is False
     assert "timed out" in output.lower()
-    time.sleep(0.5)
+    _assert_process_exited(child_pid_file)
     assert not marker.exists()
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session regression")
+@pytest.mark.parametrize("with_abort_event", [False, True], ids=["unclaimed", "claimed"])
+def test_successful_script_reaps_detached_descendant_after_leader_exit(
+    tmp_path,
+    monkeypatch,
+    with_abort_event,
+):
+    """A successful script may not daemonize work past its ownership boundary."""
+    import psutil
+
+    import cron.scheduler as scheduler
+
+    home = tmp_path / "profile"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    child_pid_file = tmp_path / "successful-script-descendant.pid"
+    descendant = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "time.sleep(5)"
+    )
+    (scripts / "fast-exit.py").write_text(
+        "import pathlib,subprocess,sys\n"
+        f"child=subprocess.Popen([sys.executable, '-c', {descendant!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+        "print('done')\n"
+    )
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
+    monkeypatch.setattr(scheduler, "_SCRIPT_TIMEOUT", 1)
+    monkeypatch.setattr(scheduler, "_CRON_WORKER_TERMINATE_GRACE_SECONDS", 0.03)
+    # Force environment-bound recovery after the leader exits and POSIX
+    # parentage disappears.
+    monkeypatch.setattr(
+        scheduler,
+        "_snapshot_cron_worker_descendants",
+        lambda _process: [],
+    )
+
+    abort_event = threading.Event() if with_abort_event else None
+    child = None
+    try:
+        assert scheduler._run_job_script(
+            "fast-exit.py",
+            abort_event=abort_event,
+        ) == (True, "done")
+        assert child_pid_file.exists(), "script did not publish its child identity"
+        _assert_process_exited(child_pid_file)
+    finally:
+        if child is None and child_pid_file.exists():
+            try:
+                child = psutil.Process(int(child_pid_file.read_text(encoding="utf-8")))
+            except psutil.NoSuchProcess:
+                child = None
+        if child is not None:
+            try:
+                child.kill()
+                child.wait(timeout=1.0)
+            except psutil.Error:
+                pass

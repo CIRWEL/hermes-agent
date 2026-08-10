@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -645,7 +646,7 @@ def _prepare_full_backup_cron_pair(
     stage_root = Path(stage.name)
     staged_pair_paths: list[tuple[Path, Path]] = []
     try:
-        for relative_home in sorted(profile_homes, key=str):
+        for relative_home in sorted(profile_homes, key=lambda item: str(item)):
             profile_home = home if relative_home == Path(".") else home / relative_home
             profile_stage = (
                 stage_root
@@ -1330,8 +1331,9 @@ def _snapshot_cron_pair(
     oversized_skipped: list[str],
 ) -> bool:
     """Capture one coherent definition/runtime generation, or neither file."""
+    from cron.jobs import _canonical_digest, _partition_job_records
     from cron.runtime_state import (
-        load_pending_definitions,
+        load_pending_definition_record,
         replace_runtime_states,
     )
     from hermes_time import now
@@ -1340,7 +1342,43 @@ def _snapshot_cron_pair(
     runtime_rel = "cron/runtime.db"
     jobs_src = home / jobs_rel
     runtime_src = home / runtime_rel
-    pending = load_pending_definitions(home / "cron") if runtime_src.is_file() else None
+    pending = None
+    pending_base_digest = None
+    if runtime_src.is_file():
+        pending, _generation_id, pending_base_digest = (
+            load_pending_definition_record(home / "cron")
+        )
+
+    if pending is not None:
+        current_definitions: list[Dict[str, Any]] = []
+        if jobs_src.is_file():
+            try:
+                with jobs_src.open(encoding="utf-8-sig") as handle:
+                    jobs_payload = json.load(handle)
+                current_records = (
+                    jobs_payload.get("jobs", [])
+                    if isinstance(jobs_payload, dict)
+                    else jobs_payload
+                )
+                if not isinstance(current_records, list) or not all(
+                    isinstance(record, dict) for record in current_records
+                ):
+                    raise ValueError("jobs.json does not contain a jobs list")
+                current_definitions, _runtime = _partition_job_records(current_records)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                logger.error("Cron snapshot skipped: unreadable jobs.json: %s", exc)
+                failed_dbs.append("cron/jobs.json + cron/runtime.db")
+                return False
+        if (
+            pending_base_digest is None
+            or pending_base_digest != _canonical_digest(current_definitions)
+        ):
+            logger.error(
+                "Cron snapshot skipped: pending definition ancestry does not "
+                "match current jobs.json"
+            )
+            failed_dbs.append("cron/jobs.json + cron/runtime.db")
+            return False
 
     if not jobs_src.is_file() and not runtime_src.is_file():
         return False
@@ -1834,11 +1872,21 @@ def restore_quick_snapshot(
 
     def _journal_snapshot_definitions(runtime_tmp: Path, jobs_tmp: Path) -> None:
         """Make staged runtime authoritative until staged JSON materializes."""
+        from cron.jobs import (
+            _canonical_digest,
+            _partition_job_records,
+            _read_job_payload_unlocked,
+        )
+
         with jobs_tmp.open(encoding="utf-8-sig") as handle:
             payload = json.load(handle)
         definitions = payload.get("jobs", []) if isinstance(payload, dict) else payload
         if not isinstance(definitions, list):
             raise ValueError("snapshot cron/jobs.json does not contain a jobs list")
+        current_records, _needs_rewrite = _read_job_payload_unlocked()
+        current_definitions, _runtime = _partition_job_records(current_records)
+        generation_id = uuid.uuid4().hex
+        base_definitions_digest = _canonical_digest(current_definitions)
         definitions_json = json.dumps(
             definitions,
             ensure_ascii=False,
@@ -1851,18 +1899,44 @@ def restore_quick_snapshot(
                     """
                     CREATE TABLE IF NOT EXISTS pending_definitions (
                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        definitions_json TEXT NOT NULL
+                        definitions_json TEXT NOT NULL,
+                        generation_id TEXT,
+                        base_definitions_digest TEXT
                     )
                     """
                 )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(pending_definitions)")
+                }
+                if "generation_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE pending_definitions ADD COLUMN generation_id TEXT"
+                    )
+                if "base_definitions_digest" not in columns:
+                    conn.execute(
+                        "ALTER TABLE pending_definitions "
+                        "ADD COLUMN base_definitions_digest TEXT"
+                    )
                 conn.execute(
                     """
-                    INSERT INTO pending_definitions (singleton, definitions_json)
-                    VALUES (1, ?)
+                    INSERT INTO pending_definitions (
+                        singleton,
+                        definitions_json,
+                        generation_id,
+                        base_definitions_digest
+                    )
+                    VALUES (1, ?, ?, ?)
                     ON CONFLICT(singleton) DO UPDATE SET
-                    definitions_json = excluded.definitions_json
+                    definitions_json = excluded.definitions_json,
+                    generation_id = excluded.generation_id,
+                    base_definitions_digest = excluded.base_definitions_digest
                     """,
-                    (definitions_json,),
+                    (
+                        definitions_json,
+                        generation_id,
+                        base_definitions_digest,
+                    ),
                 )
 
     def _clear_live_definition_journal(runtime_path: Path) -> None:

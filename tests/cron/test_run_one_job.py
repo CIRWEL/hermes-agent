@@ -337,6 +337,41 @@ def test_successful_finalization_propagates_run_claim_token(monkeypatch):
     assert marked[-1][1]["expected_run_claim_id"] == "run-a"
 
 
+def test_terminal_ledger_error_cannot_reclassify_accepted_success(monkeypatch):
+    """Delivery and fenced job finalization stay true after a ledger outage."""
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *a, **k: True)
+
+    def mark(jid, ok, *_args, **_kwargs):
+        calls.append(("mark", jid, ok))
+        return True
+
+    monkeypatch.setattr(s, "mark_job_run", mark)
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("ledger busy")),
+    )
+
+    ok = s.run_one_job(
+        {
+            "id": "accepted-before-ledger-error",
+            "name": "t",
+            "execution_id": "exec-accepted",
+            "_fire_claim_id": "fire-a",
+        }
+    )
+
+    assert ok is True
+    assert [call for call in calls if call[0] == "deliver"] == [
+        ("deliver", "accepted-before-ledger-error")
+    ]
+    assert [call for call in calls if call[0] == "mark"] == [
+        ("mark", "accepted-before-ledger-error", True)
+    ]
+
+
 def test_exception_finalization_propagates_run_claim_token(monkeypatch):
     """Exception bookkeeping cannot clear a replacement run token."""
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)

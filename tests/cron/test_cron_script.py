@@ -156,13 +156,25 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             captured["argv"] = argv
             captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+            return SimpleNamespace(
+                pid=12345,
+                returncode=0,
+                communicate=lambda timeout: ("ok\n", ""),
+                poll=lambda: 0,
+            )
 
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(sched_mod, "_snapshot_cron_worker_descendants", lambda _p: [])
+        monkeypatch.setattr(
+            sched_mod,
+            "_snapshot_reparented_cron_workers",
+            lambda *_args, **_kwargs: [],
+        )
 
         success, output = _run_job_script("probe.py")
 
@@ -185,12 +197,23 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             captured["argv"] = argv
             captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+            return SimpleNamespace(
+                pid=12345,
+                returncode=0,
+                communicate=lambda timeout: ("ok\n", ""),
+                poll=lambda: 0,
+            )
 
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(sched_mod, "_snapshot_cron_worker_descendants", lambda _p: [])
+        monkeypatch.setattr(
+            sched_mod,
+            "_snapshot_reparented_cron_workers",
+            lambda *_args, **_kwargs: [],
+        )
 
         success, output = _run_job_script("probe.py")
 

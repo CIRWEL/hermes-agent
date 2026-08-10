@@ -44,7 +44,13 @@ Job state is split across two profile-local artifacts under `~/.hermes/cron/`:
 so callers still see one merged record per job. `jobs.json` keeps atomic write
 semantics (write to temp file, then rename); cross-store writes journal the
 definition change in SQLite first so an interrupted write recovers
-idempotently on the next load.
+idempotently on the next load. Definition-changing writers fail closed if the
+cross-process store lock cannot be acquired. Recovery journals record the
+definition generation they descend from, so an interrupted stale writer cannot
+replace a newer hand-deployed artifact. On an authoritative locked load,
+runtime rows absent from `jobs.json` are pruned; this prevents removed jobs from
+reappearing with stale claims, counters, or completion tombstones if their IDs
+are later reused.
 
 ### Migration from combined stores
 

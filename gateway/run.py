@@ -26915,7 +26915,13 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    cron_provider=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -26959,6 +26965,16 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if cron_provider is not None:
+            try:
+                cron_provider.maintenance()
+            except BaseException as exc:
+                logger.error(
+                    "Cron provider maintenance failed: %s",
+                    exc,
+                    exc_info=True,
+                )
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -27664,24 +27680,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_provider = resolve_cron_scheduler()
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and getattr(runner.config, "multiplex_profiles", False)
-    ):
+    # Multiplex profiles: providers that declare a compatible ``profile_homes``
+    # keyword receive every served store for startup and maintenance recovery.
+    if getattr(runner.config, "multiplex_profiles", False):
         try:
             from hermes_cli.profiles import profiles_to_serve
 
             profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
+            start_parameters = inspect.signature(cron_provider.start).parameters
+            accepts_profile_homes = "profile_homes" in start_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in start_parameters.values()
+            )
+            if profile_homes and accepts_profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
                 logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                    "Cron scheduler will serve %d profile(s) under multiplex: %s",
                     len(profile_homes),
                     [p[0] if isinstance(p, tuple) else p for p in profile_homes],
                 )
@@ -27713,7 +27727,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+            "cron_provider": cron_provider,
+        },
         daemon=True,
         name="gateway-housekeeping",
     )

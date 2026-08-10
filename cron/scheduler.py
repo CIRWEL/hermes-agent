@@ -2293,6 +2293,8 @@ _CRON_WORKER_POLL_SECONDS = 0.25
 _CRON_WORKER_TERMINATE_GRACE_SECONDS = 3.0
 _CRON_WORKER_RESULT_PREFIX = "__HERMES_CRON_RESULT__"
 _CRON_WORKER_PULSE_ENV = "HERMES_CRON_WORKER_PULSE"
+_CRON_WORKER_ID_ENV = "HERMES_CRON_WORKER_ID"
+_CRON_SCRIPT_WORKER_ID_ENV = "HERMES_CRON_SCRIPT_WORKER_ID"
 
 
 def _touch_cron_worker_pulse(pulse_path: str) -> bool:
@@ -2563,56 +2565,105 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        script_worker_id = uuid.uuid4().hex
+        env[_CRON_SCRIPT_WORKER_ID_ENV] = script_worker_id
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        if abort_event is None:
-            result = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=script_timeout,
-                cwd=_script_cwd,
-                env=env,
-                **popen_kwargs,
-            )
-            returncode = result.returncode
-            stdout = (result.stdout or "").strip()
-            stderr = (result.stderr or "").strip()
-        else:
-            owned_popen_kwargs = dict(popen_kwargs)
-            if sys.platform != "win32":
-                owned_popen_kwargs["start_new_session"] = True
-            process = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=_script_cwd,
-                env=env,
-                **owned_popen_kwargs,
-            )
-            deadline = time.monotonic() + script_timeout
-            worker_pulse_path = os.getenv(_CRON_WORKER_PULSE_ENV, "").strip()
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=_script_cwd,
+            env=env,
+            **popen_kwargs,
+        )
+        observed_descendants: dict[int, Any] = {}
+
+        def _remember_script_descendants(*, include_reparented: bool = False) -> None:
+            for child in _snapshot_cron_worker_descendants(process):
+                observed_descendants.setdefault(
+                    getattr(child, "pid", id(child)),
+                    child,
+                )
+            if include_reparented:
+                # Stop the known process group/tree before the host-wide
+                # environment scan. A slow scan must not extend the window in
+                # which a stale owner can perform side effects.
+                _signal_known_cron_worker(
+                    process,
+                    list(observed_descendants.values()),
+                )
+                for child in _snapshot_reparented_cron_workers(
+                    process,
+                    script_worker_id,
+                    identity_env=_CRON_SCRIPT_WORKER_ID_ENV,
+                ):
+                    observed_descendants.setdefault(
+                        getattr(child, "pid", id(child)),
+                        child,
+                    )
+
+        deadline = time.monotonic() + script_timeout
+        worker_pulse_path = os.getenv(_CRON_WORKER_PULSE_ENV, "").strip()
+        _touch_cron_worker_pulse(worker_pulse_path)
+        try:
             while True:
                 try:
                     stdout_raw, stderr_raw = process.communicate(timeout=0.05)
                     break
                 except subprocess.TimeoutExpired:
                     _touch_cron_worker_pulse(worker_pulse_path)
-                    if abort_event.is_set():
-                        _terminate_cron_worker(process)
+                    _remember_script_descendants()
+                    if process.poll() is not None:
+                        # The script leader exited while a detached child kept
+                        # inherited pipes open. Recover it by the per-script
+                        # identity before doing a bounded final drain.
+                        _remember_script_descendants(include_reparented=True)
+                        _terminate_cron_worker(
+                            process,
+                            descendants=list(observed_descendants.values()),
+                        )
+                        try:
+                            stdout_raw, stderr_raw = process.communicate(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            stdout_raw = _drain_terminated_cron_process(process)
+                            stderr_raw = ""
+                        break
+                    if abort_event is not None and abort_event.is_set():
+                        _remember_script_descendants(include_reparented=True)
+                        _terminate_cron_worker(
+                            process,
+                            descendants=list(observed_descendants.values()),
+                        )
                         _drain_terminated_cron_process(process)
                         return False, "Fire-claim ownership was lost; script terminated."
                     if time.monotonic() >= deadline:
-                        _terminate_cron_worker(process)
+                        _remember_script_descendants(include_reparented=True)
+                        _terminate_cron_worker(
+                            process,
+                            descendants=list(observed_descendants.values()),
+                        )
                         _drain_terminated_cron_process(process)
                         raise subprocess.TimeoutExpired(argv, script_timeout)
             returncode = process.returncode
             stdout = (stdout_raw or "").strip()
             stderr = (stderr_raw or "").strip()
+        finally:
+            # Successful scripts are contained too. A script that daemonizes a
+            # child has not transferred ownership to a service manager, so the
+            # child must not outlive the cron execution boundary.
+            _remember_script_descendants(include_reparented=True)
+            if observed_descendants or process.poll() is None:
+                _terminate_cron_worker(
+                    process,
+                    descendants=list(observed_descendants.values()),
+                )
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -4775,13 +4826,53 @@ def _snapshot_cron_worker_descendants(process: subprocess.Popen) -> list:
     if os.name == "nt":
         return []
     try:
-        import psutil  # type: ignore
+        import psutil
 
         return psutil.Process(process.pid).children(recursive=True)
     except Exception:
         logger.debug(
             "Could not snapshot descendants of cron worker PID %d",
             process.pid,
+            exc_info=True,
+        )
+        return []
+
+
+def _snapshot_reparented_cron_workers(
+    process: subprocess.Popen,
+    worker_id: str,
+    *,
+    identity_env: str = _CRON_WORKER_ID_ENV,
+) -> list:
+    """Find same-worker processes even after their leader has disappeared.
+
+    Descendants inherit the nonce-bound worker environment. That gives abnormal
+    cleanup an identity-safe fallback after POSIX reparenting has erased the
+    ancestry that ``Process.children()`` relies on. The scan is deliberately
+    reserved for teardown paths; normal polling keeps using the cheap tree walk.
+    """
+    if not worker_id:
+        return []
+    try:
+        import psutil
+
+        matched = []
+        excluded_pids = {os.getpid(), process.pid}
+        for candidate in psutil.process_iter():
+            if candidate.pid in excluded_pids:
+                continue
+            try:
+                if candidate.environ().get(identity_env) == worker_id:
+                    # Access create_time now so the retained Process object is
+                    # bound to this identity before a PID can be reused.
+                    candidate.create_time()
+                    matched.append(candidate)
+            except (psutil.Error, OSError, PermissionError):
+                continue
+        return matched
+    except Exception:
+        logger.debug(
+            "Could not scan for reparented cron worker processes",
             exc_info=True,
         )
         return []
@@ -4811,7 +4902,7 @@ def _wait_for_cron_worker_descendants(descendants: list, timeout: float) -> None
     if not descendants:
         return
     try:
-        import psutil  # type: ignore
+        import psutil
 
         _gone, alive = psutil.wait_procs(descendants, timeout=max(0.0, timeout))
         if alive:
@@ -4823,75 +4914,140 @@ def _wait_for_cron_worker_descendants(descendants: list, timeout: float) -> None
         logger.debug("Could not wait for cron worker descendants", exc_info=True)
 
 
-def _terminate_cron_worker(process: subprocess.Popen) -> None:
-    """Terminate a cron worker tree and return only after process exit."""
-    if process.poll() is not None:
-        return
-    descendants = _snapshot_cron_worker_descendants(process)
-    if os.name == "nt":
-        try:
-            taskkill = subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS,
-            )
-            if taskkill.returncode != 0:
-                process.terminate()
-        except (OSError, subprocess.TimeoutExpired):
+def _signal_known_cron_worker(
+    process: subprocess.Popen,
+    descendants: list,
+) -> None:
+    """Promptly stop a known worker group/tree before detached-host discovery."""
+    leader_alive = process.poll() is None
+    if leader_alive:
+        if os.name == "nt":
             try:
                 process.terminate()
             except OSError:
                 pass
-        try:
-            process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            process.kill()
-        except OSError:
-            pass
-        process.wait()
+        else:
+            try:
+                # Freeze the known group while detached identity discovery runs.
+                # Teardown immediately applies TERM/KILL escalation afterwards.
+                os.killpg(process.pid, signal.SIGSTOP)  # windows-footgun: ok — POSIX branch
+            except (OSError, ProcessLookupError):
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+    _signal_cron_worker_descendants(descendants, force=False)
+    if os.name != "nt":
+        for child in descendants:
+            try:
+                child.suspend()
+            except Exception:
+                pass
+
+
+def _terminate_cron_worker(
+    process: subprocess.Popen,
+    *,
+    descendants: Optional[list] = None,
+) -> None:
+    """Terminate a worker plus descendants observed while it was alive."""
+    retained = {
+        getattr(child, "pid", id(child)): child
+        for child in (descendants or [])
+    }
+    leader_alive = process.poll() is None
+    if leader_alive:
+        for child in _snapshot_cron_worker_descendants(process):
+            retained.setdefault(getattr(child, "pid", id(child)), child)
+    descendants = list(retained.values())
+    if not leader_alive and not descendants:
         return
 
-    try:
-        os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX branch
-    except (OSError, ProcessLookupError):
-        try:
-            process.terminate()
-        except OSError:
-            pass
-    _signal_cron_worker_descendants(descendants, force=False)
-    try:
-        process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-
-    # Always signal the group after the leader exits: a descendant may ignore
-    # SIGTERM and keep inherited stdout/stderr pipes open after reparenting.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch
-    except (OSError, ProcessLookupError):
-        if process.poll() is None:
+    if os.name == "nt":
+        if leader_alive:
+            try:
+                taskkill = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS,
+                )
+                if taskkill.returncode != 0:
+                    process.terminate()
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
+                _signal_cron_worker_descendants(descendants, force=True)
+                _wait_for_cron_worker_descendants(
+                    descendants,
+                    _CRON_WORKER_TERMINATE_GRACE_SECONDS,
+                )
+                return
+            except subprocess.TimeoutExpired:
+                pass
             try:
                 process.kill()
             except OSError:
                 pass
+            try:
+                process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.warning("Cron worker PID %d did not exit after hard stop", process.pid)
+        _signal_cron_worker_descendants(descendants, force=True)
+        _wait_for_cron_worker_descendants(
+            descendants,
+            _CRON_WORKER_TERMINATE_GRACE_SECONDS,
+        )
+        return
+
+    if leader_alive:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX branch
+        except (OSError, ProcessLookupError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    _signal_cron_worker_descendants(descendants, force=False)
+    if leader_alive:
+        try:
+            process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Always signal retained children after the leader exits: a detached child
+    # may ignore SIGTERM and keep inherited stdout/stderr pipes open.
+    if leader_alive:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch
+        except (OSError, ProcessLookupError):
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
     _signal_cron_worker_descendants(descendants, force=True)
     if process.poll() is None:
-        process.wait()
+        try:
+            process.wait(timeout=_CRON_WORKER_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("Cron worker PID %d did not exit after hard stop", process.pid)
     _wait_for_cron_worker_descendants(
         descendants,
         _CRON_WORKER_TERMINATE_GRACE_SECONDS,
     )
 
 
-def _drain_terminated_cron_process(process: subprocess.Popen) -> None:
-    """Bound pipe draining after process-tree termination."""
+def _drain_terminated_cron_process(process: subprocess.Popen) -> str:
+    """Bound pipe draining after termination and return captured stdout."""
     try:
-        process.communicate(timeout=1.0)
+        stdout, _stderr = process.communicate(timeout=1.0)
+        return stdout or ""
     except subprocess.TimeoutExpired:
         for stream in (process.stdout, process.stderr):
             if stream is not None:
@@ -4899,6 +5055,7 @@ def _drain_terminated_cron_process(process: subprocess.Popen) -> None:
                     stream.close()
                 except OSError:
                     pass
+        return ""
 
 
 def _run_job_in_killable_process(
@@ -4962,6 +5119,7 @@ def _run_job_in_killable_process(
     env["HERMES_HOME"] = str(home)
     env["HERMES_CRON_TIMEOUT"] = "0"
     env[_CRON_WORKER_PULSE_ENV] = str(pulse_path)
+    env[_CRON_WORKER_ID_ENV] = nonce
     env["HERMES_CRON_WORKER_POLL_SECONDS"] = str(_CRON_WORKER_POLL_SECONDS)
     popen_kwargs: dict = {
         "stdin": subprocess.PIPE,
@@ -4997,6 +5155,26 @@ def _run_job_in_killable_process(
     last_pulse_mtime: Optional[int] = None
     last_claim_heartbeat = last_activity
     stdout = ""
+    observed_descendants: dict[int, Any] = {}
+    valid_result = False
+
+    def _remember_descendants(*, include_reparented: bool = False) -> None:
+        for child in _snapshot_cron_worker_descendants(process):
+            observed_descendants.setdefault(
+                getattr(child, "pid", id(child)),
+                child,
+            )
+        if include_reparented:
+            _signal_known_cron_worker(
+                process,
+                list(observed_descendants.values()),
+            )
+            for child in _snapshot_reparented_cron_workers(process, nonce):
+                observed_descendants.setdefault(
+                    getattr(child, "pid", id(child)),
+                    child,
+                )
+
     try:
         if process.stdin is None:
             raise RuntimeError("isolated cron worker stdin is unavailable")
@@ -5013,7 +5191,19 @@ def _run_job_in_killable_process(
                 )
                 break
             except subprocess.TimeoutExpired:
-                pass
+                _remember_descendants()
+                if process.poll() is not None:
+                    # The worker leader has exited, but an observed child still
+                    # owns an inherited pipe. Recover reparented processes by
+                    # nonce, clean them, and bound the final pipe drain instead
+                    # of waiting for the inactivity deadline.
+                    _remember_descendants(include_reparented=True)
+                    _terminate_cron_worker(
+                        process,
+                        descendants=list(observed_descendants.values()),
+                    )
+                    stdout = _drain_terminated_cron_process(process)
+                    break
 
             now_mono = time.monotonic()
             try:
@@ -5026,13 +5216,21 @@ def _run_job_in_killable_process(
 
             if now_mono - last_claim_heartbeat >= _RUN_CLAIM_HEARTBEAT_SECONDS:
                 if not _heartbeat_ownership():
-                    _terminate_cron_worker(process)
+                    _remember_descendants(include_reparented=True)
+                    _terminate_cron_worker(
+                        process,
+                        descendants=list(observed_descendants.values()),
+                    )
                     _drain_terminated_cron_process(process)
                     return False, "", "", "Cron job ownership lost while worker was active"
                 last_claim_heartbeat = now_mono
 
             if timeout is not None and now_mono - last_activity >= timeout:
-                _terminate_cron_worker(process)
+                _remember_descendants(include_reparented=True)
+                _terminate_cron_worker(
+                    process,
+                    descendants=list(observed_descendants.values()),
+                )
                 _drain_terminated_cron_process(process)
                 return (
                     False,
@@ -5058,10 +5256,15 @@ def _run_job_in_killable_process(
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             logger.error("Job '%s': isolated cron worker returned invalid result", job_id)
             return False, "", "", "Isolated cron worker returned an invalid result"
+        valid_result = True
         return result[0], result[1], result[2], result[3]
     finally:
-        if process.poll() is None:
-            _terminate_cron_worker(process)
+        _remember_descendants(include_reparented=True)
+        if observed_descendants or not valid_result:
+            _terminate_cron_worker(
+                process,
+                descendants=list(observed_descendants.values()),
+            )
         with _running_lock:
             if _active_cron_worker_processes.get(job_id) is process:
                 _active_cron_worker_processes.pop(job_id, None)
@@ -5195,6 +5398,7 @@ def run_one_job(
         )
         return False
 
+    effects_finalized = False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -5389,12 +5593,13 @@ def run_one_job(
         finalization_claims = {"expected_fire_claim_id": fire_claim_id}
         if run_claim_id:
             finalization_claims["expected_run_claim_id"] = run_claim_id
+        if blocked_config:
+            finalization_claims["status"] = "blocked_config"
         finalized = mark_job_run(
             job["id"],
             success,
             error,
             delivery_error=delivery_error,
-            status="blocked_config" if blocked_config else None,
             **finalization_claims,
         )
         if finalized is False:
@@ -5409,6 +5614,7 @@ def run_one_job(
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
+        effects_finalized = finalized is not False
         finish_execution(
             execution_id,
             success=success,
@@ -5429,6 +5635,19 @@ def run_one_job(
         # anything that isn't a plain Exception.
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
+        if effects_finalized:
+            # Delivery and the ownership-fenced job row are already durable.
+            # A separate execution-ledger outage leaves that audit row active
+            # for conservative reconciliation; it must not rewrite accepted
+            # work as failed or invite a duplicate manual retry.
+            logger.error(
+                "Execution ledger finalization failed after accepted effects "
+                "for job %s; preserving the accepted job outcome",
+                job["id"],
+            )
+            if not isinstance(e, Exception):
+                raise
+            return True
         try:
             interrupted_reason = _consume_interrupted_reason(job["id"])
             if interrupted_reason is not None:

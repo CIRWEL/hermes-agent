@@ -54,6 +54,8 @@ class ChronosCronScheduler(CronScheduler):
         self._armed: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._client = None  # lazily constructed (no network in is_available)
+        self._stop_event: Optional[threading.Event] = None
+        self._profile_homes: Any = None
 
     # -- identity / availability -----------------------------------------
 
@@ -100,16 +102,34 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- lifecycle --------------------------------------------------------
 
-    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+    def start(
+        self,
+        stop_event,
+        *,
+        adapters=None,
+        loop=None,
+        interval=60,
+        profile_homes=None,
+    ):
         """Arm all enabled jobs via NAS, then RETURN immediately.
 
         Does NOT block and does NOT spawn a 60s wake (DQ-1) — that is the whole
         point of scale-to-zero. The machine wakes only on a NAS→agent fire.
         """
+        self._stop_event = stop_event
+        self._profile_homes = profile_homes
+        if stop_event.is_set():
+            return
         # A new provider lifecycle cannot prove what an interrupted prior
         # process did. Classify those attempts unknown for audit only; do not
         # requeue them here.
-        self.recover_interrupted()
+        self._recover_profiles_safely(
+            logger,
+            stop_event=stop_event,
+            profile_homes=profile_homes,
+        )
+        if stop_event.is_set():
+            return
         try:
             self.reconcile()
         except Exception as e:
@@ -119,9 +139,22 @@ class ChronosCronScheduler(CronScheduler):
     def stop(self) -> None:
         return None
 
+    def maintenance(self) -> None:
+        """Reconcile owner liveness on the gateway's existing warm cadence."""
+        if self._stop_event is not None and self._stop_event.is_set():
+            return
+        self._recover_profiles_safely(
+            logger,
+            stop_event=self._stop_event,
+            profile_homes=self._profile_homes,
+        )
+
     def on_jobs_changed(self) -> None:
         """A job was created/updated/removed/paused/resumed — reconcile the NAS
         registry so the affected one-shot is (re-)armed or cancelled."""
+        self.maintenance()
+        if self._stop_event is not None and self._stop_event.is_set():
+            return
         try:
             self.reconcile()
         except Exception as e:
@@ -233,6 +266,9 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
+        self.maintenance()
+        if self._stop_event is not None and self._stop_event.is_set():
+            return False
         ran = super().fire_due(job_id, adapters=adapters, loop=loop)
         if ran:
             from cron.jobs import get_job

@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
 import threading
 import uuid
@@ -18,15 +19,46 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_PROCESS_PID = os.getpid()
+_PROCESS_HOST_ID = (
+    os.getenv("HERMES_HOST_ID", "").strip()
+    or socket.gethostname()
+)
+
+
+def _current_process_identity() -> tuple[str, int]:
+    """Return a fork-safe process UUID and PID for ownership fencing."""
+    global _PROCESS_ID, _PROCESS_PID
+    pid = os.getpid()
+    with _lock:
+        if pid != _PROCESS_PID:
+            # A fork inherits module globals. A distinct child identity keeps
+            # parent/child attempts behind the ordinary PID/birth liveness gate.
+            _PROCESS_ID = uuid.uuid4().hex
+            _PROCESS_PID = pid
+        return _PROCESS_ID, pid
+
+
+def _current_executions_file() -> os.PathLike[str]:
+    """Resolve the ledger for the active profile while honoring test overrides."""
+    configured = os.fspath(EXECUTIONS_FILE)
+    if os.path.abspath(configured) != os.path.abspath(os.fspath(_IMPORT_EXECUTIONS_FILE)):
+        # ``EXECUTIONS_FILE`` is the documented compatibility seam used by
+        # tests and embedders. A deliberate reassignment remains authoritative.
+        return EXECUTIONS_FILE
+    return get_hermes_home().resolve() / "cron" / "executions.db"
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = _current_executions_file()
+    parent = os.path.dirname(os.path.abspath(os.fspath(executions_file)))
+    os.makedirs(parent, exist_ok=True)
+    return sqlite3.connect(executions_file, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -36,11 +68,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     apply_wal_with_fallback(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
+    # Serialize legacy schema discovery and migration across shared-home replicas.
+    conn.execute("BEGIN IMMEDIATE")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
+             host_id TEXT,
              process_id TEXT NOT NULL,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
@@ -52,6 +87,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "host_id" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN host_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -60,6 +101,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    # Release the schema-migration writer lock before the caller's transaction.
+    conn.commit()
 
 
 @contextmanager
@@ -115,9 +158,15 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        # The PID exists, but legacy rows lack a birth timestamp. Treat that as
+        # indeterminate rather than risking a false terminalization.
+        return True
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        # A permission/transient probe failure is not proof that the exact owner
+        # died. A later reconciliation cycle can retry the liveness check.
+        return True
+    return current == started_at
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -136,14 +185,14 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
-    pid = os.getpid()
+    process_id, pid = _current_process_identity()
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
+               (id, job_id, source, host_id, process_id, pid, process_started_at,
                 status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_HOST_ID, process_id, pid,
              _process_start_time(pid), now),
         )
         row = conn.execute(
@@ -199,15 +248,30 @@ def finish_execution(
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()
+    process_id, process_pid = _current_process_identity()
+    process_started_at = _process_start_time(process_pid)
     changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, host_id, process_id, pid, process_started_at FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+            # PID and process-birth identities are meaningful only inside the
+            # host namespace that recorded them. Legacy rows have no host
+            # identity, so fail safe rather than guessing that their owner died.
+            if not row["host_id"] or row["host_id"] != _PROCESS_HOST_ID:
+                continue
+            if (
+                row["process_id"] == process_id
+                and int(row["pid"]) == process_pid
+                and (
+                    row["process_started_at"] is None
+                    or process_started_at is None
+                    or row["process_started_at"] == process_started_at
+                )
+            ):
                 continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
@@ -215,8 +279,8 @@ def recover_interrupted_executions() -> int:
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
                    WHERE id=? AND status IN ('claimed','running')""",
                 (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
+                 "Execution owner exited before recording a durable terminal state; "
+                 "whether side effects ran is unknown.",
                  row["id"]),
             )
             changed += cur.rowcount
