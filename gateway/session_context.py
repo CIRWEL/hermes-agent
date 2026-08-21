@@ -109,6 +109,15 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
+# Immutable scheduler identities for the active cron attempt. These are
+# ContextVars rather than process-global environment variables so parallel
+# jobs cannot overwrite each other. The local subprocess bridge exports them
+# from _VAR_MAP when a tool starts a child process.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_EXECUTION_ID: ContextVar = ContextVar(
+    "HERMES_CRON_EXECUTION_ID", default=_UNSET
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -152,10 +161,25 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_CRON_SESSION": _CRON_SESSION,
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
+    "HERMES_CRON_EXECUTION_ID": _CRON_EXECUTION_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+@contextmanager
+def bind_cron_execution(job_id: str, execution_id: str) -> Iterator[None]:
+    """Bind one cron attempt's immutable identity and restore any outer run."""
+
+    job_token = _CRON_JOB_ID.set(str(job_id or ""))
+    execution_token = _CRON_EXECUTION_ID.set(str(execution_id or ""))
+    try:
+        yield
+    finally:
+        _CRON_EXECUTION_ID.reset(execution_token)
+        _CRON_JOB_ID.reset(job_token)
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -251,6 +275,7 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to

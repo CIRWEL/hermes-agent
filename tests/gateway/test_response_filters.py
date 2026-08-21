@@ -1,4 +1,5 @@
 from gateway.response_filters import (
+    is_autonomous_silence_contract_violation,
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
@@ -18,4 +19,20 @@ def test_autonomous_silence_accepts_marker_with_own_line_note():
     assert is_autonomous_silence_response("no_reply\nduplicate inbound, already handled")
     assert is_autonomous_silence_response("[SILENT] No changes detected")
 
+
+def test_autonomous_silence_contract_violation_requires_mixed_content():
+    for response in (
+        "[SILENT]\n\nNothing new this tick.",
+        "2 deals filtered\n\n[SILENT]",
+        "[SILENT] No changes detected",
+    ):
+        assert is_autonomous_silence_contract_violation(response)
+
+    for response in (
+        "[SILENT]",
+        "NO_REPLY",
+        "I considered staying [SILENT] but here is the report.",
+        "ordinary report",
+    ):
+        assert not is_autonomous_silence_contract_violation(response)
 

@@ -582,6 +582,14 @@ def _is_cron_silence_response(text: str) -> bool:
 
     return is_autonomous_silence_response(text)
 
+
+def _is_cron_silence_contract_violation(text: str) -> bool:
+    """Return True when a cron reply mixes a silence marker with content."""
+
+    from gateway.response_filters import is_autonomous_silence_contract_violation
+
+    return is_autonomous_silence_contract_violation(text)
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -6062,7 +6070,10 @@ def run_job(
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
-        _audit_response_silent = _is_cron_silence_response(final_response or "")
+        _audit_response_silent = (
+            _is_cron_silence_response(final_response or "")
+            and not _is_cron_silence_contract_violation(final_response or "")
+        )
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
@@ -6398,39 +6409,47 @@ def run_one_job(
     run cooperatively — agent interruption AND script process-tree kill —
     through the single fenced completion path.
     """
-    claim = job.get("fire_claim")
-    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    execution_token = object()
-    profile_home = _get_hermes_home().resolve()
-    with _running_lock:
-        _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
-            fire_owner or None,
-            profile_home,
-        )
-    try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
-                job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token,
-            ),
-        )
-    finally:
+    execution_id = job.get("execution_id")
+    if not execution_id:
+        execution_id = create_execution(job["id"], source="direct")["id"]
+    job = dict(job, execution_id=execution_id)
+
+    from gateway.session_context import bind_cron_execution
+
+    with bind_cron_execution(job["id"], execution_id):
+        claim = job.get("fire_claim")
+        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        execution_token = object()
+        profile_home = _get_hermes_home().resolve()
         with _running_lock:
-            executions = _running_fire_owners.get(job["id"])
-            if executions is not None:
-                executions.pop(execution_token, None)
-                if not executions:
-                    _running_fire_owners.pop(job["id"], None)
+            _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
+                fire_owner or None,
+                profile_home,
+            )
+        try:
+            return _run_with_fire_claim_heartbeat(
+                job,
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token,
+                ),
+            )
+        finally:
+            with _running_lock:
+                executions = _running_fire_owners.get(job["id"])
+                if executions is not None:
+                    executions.pop(execution_token, None)
+                    if not executions:
+                        _running_fire_owners.pop(job["id"], None)
 
 
 def _run_one_job_body(
@@ -6473,9 +6492,7 @@ def _run_one_job_body(
             fire_claim_lost.set()
         return True
 
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+    execution_id = job["execution_id"]
     delivery_attempted = False
     delivery_error = None
     try:
@@ -6613,6 +6630,17 @@ def _run_one_job_body(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # A silence marker is a control token, not report punctuation. If
+            # the agent mixes it with substantive content, preserve the full
+            # output locally but fail the run before the irreversible send.
+            # Only the compact failure summary below may reach the operator.
+            if success and _is_cron_silence_contract_violation(final_response):
+                success = False
+                error = (
+                    "Agent combined a silence marker with substantive content; "
+                    "the cron response contract blocked delivery."
+                )
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -6680,8 +6708,9 @@ def _run_one_job_body(
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
+            # #46917). Mixed marker/content responses have already been
+            # converted to failed runs above, so only exact markers can reach
+            # this successful-suppression branch.
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
