@@ -5225,8 +5225,6 @@ def run_job(
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
         cwd=_job_workdir or "",
-        cron_job_id=job_id,
-        cron_execution_id=str(job.get("execution_id") or ""),
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -6411,39 +6409,47 @@ def run_one_job(
     run cooperatively — agent interruption AND script process-tree kill —
     through the single fenced completion path.
     """
-    claim = job.get("fire_claim")
-    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    execution_token = object()
-    profile_home = _get_hermes_home().resolve()
-    with _running_lock:
-        _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
-            fire_owner or None,
-            profile_home,
-        )
-    try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
-                job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token,
-            ),
-        )
-    finally:
+    execution_id = job.get("execution_id")
+    if not execution_id:
+        execution_id = create_execution(job["id"], source="direct")["id"]
+    job = dict(job, execution_id=execution_id)
+
+    from gateway.session_context import bind_cron_execution
+
+    with bind_cron_execution(job["id"], execution_id):
+        claim = job.get("fire_claim")
+        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        execution_token = object()
+        profile_home = _get_hermes_home().resolve()
         with _running_lock:
-            executions = _running_fire_owners.get(job["id"])
-            if executions is not None:
-                executions.pop(execution_token, None)
-                if not executions:
-                    _running_fire_owners.pop(job["id"], None)
+            _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
+                fire_owner or None,
+                profile_home,
+            )
+        try:
+            return _run_with_fire_claim_heartbeat(
+                job,
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token,
+                ),
+            )
+        finally:
+            with _running_lock:
+                executions = _running_fire_owners.get(job["id"])
+                if executions is not None:
+                    executions.pop(execution_token, None)
+                    if not executions:
+                        _running_fire_owners.pop(job["id"], None)
 
 
 def _run_one_job_body(
@@ -6486,10 +6492,7 @@ def _run_one_job_body(
             fire_claim_lost.set()
         return True
 
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
-    job = dict(job, execution_id=execution_id)
+    execution_id = job["execution_id"]
     delivery_attempted = False
     delivery_error = None
     try:

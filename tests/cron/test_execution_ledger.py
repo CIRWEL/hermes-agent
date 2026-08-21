@@ -217,19 +217,13 @@ def test_cron_execution_context_bridges_to_subprocess_env():
     import contextvars
 
     from gateway.session_context import (
-        clear_session_vars,
+        bind_cron_execution,
         get_session_env,
-        set_session_vars,
     )
     from tools.environments.local import _inject_session_context_env
 
     def exercise():
-        tokens = set_session_vars(
-            cron_session="1",
-            cron_job_id="job-4",
-            cron_execution_id="exec-4",
-        )
-        try:
+        with bind_cron_execution("job-4", "exec-4"):
             assert get_session_env("HERMES_CRON_JOB_ID") == "job-4"
             assert get_session_env("HERMES_CRON_EXECUTION_ID") == "exec-4"
             child_env = {
@@ -239,8 +233,13 @@ def test_cron_execution_context_bridges_to_subprocess_env():
             _inject_session_context_env(child_env)
             assert child_env["HERMES_CRON_JOB_ID"] == "job-4"
             assert child_env["HERMES_CRON_EXECUTION_ID"] == "exec-4"
-        finally:
-            clear_session_vars(tokens)
+
+            with bind_cron_execution("job-5", "exec-5"):
+                assert get_session_env("HERMES_CRON_JOB_ID") == "job-5"
+                assert get_session_env("HERMES_CRON_EXECUTION_ID") == "exec-5"
+
+            assert get_session_env("HERMES_CRON_JOB_ID") == "job-4"
+            assert get_session_env("HERMES_CRON_EXECUTION_ID") == "exec-4"
 
     contextvars.copy_context().run(exercise)
 

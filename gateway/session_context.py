@@ -169,6 +169,19 @@ _VAR_MAP = {
 }
 
 
+@contextmanager
+def bind_cron_execution(job_id: str, execution_id: str) -> Iterator[None]:
+    """Bind one cron attempt's immutable identity and restore any outer run."""
+
+    job_token = _CRON_JOB_ID.set(str(job_id or ""))
+    execution_token = _CRON_EXECUTION_ID.set(str(execution_id or ""))
+    try:
+        yield
+    finally:
+        _CRON_EXECUTION_ID.reset(execution_token)
+        _CRON_JOB_ID.reset(job_token)
+
+
 def set_current_session_id(session_id: str) -> None:
     """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
 
@@ -243,8 +256,6 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
-    cron_job_id: str = "",
-    cron_execution_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -265,8 +276,6 @@ def set_session_vars(
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
 
-    ``cron_job_id`` and ``cron_execution_id`` identify one immutable scheduler
-    attempt. Empty defaults mask stale ambient values for non-cron sessions.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -290,8 +299,6 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
-        _CRON_JOB_ID.set(cron_job_id),
-        _CRON_EXECUTION_ID.set(cron_execution_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -331,8 +338,6 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CRON_SESSION,
-        _CRON_JOB_ID,
-        _CRON_EXECUTION_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
