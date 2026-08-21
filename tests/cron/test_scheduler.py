@@ -974,6 +974,31 @@ class TestSilentDelivery:
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
 
+    def test_mixed_silent_response_fails_before_substantive_delivery(self):
+        response = "Substantive but untrusted report.\n\n[SILENT]"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.heartbeat_fire_claim", return_value=True), \
+             patch("cron.scheduler._run_job_in_killable_process", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("⚠️ Cron 'monitor' failed:")
+        assert "Substantive but untrusted report" not in delivered
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "Agent combined a silence marker with substantive content; "
+            "the cron response contract blocked delivery.",
+            delivery_error=None,
+            expected_fire_claim_id="claim-monitor",
+        )
+
+
     def test_report_quoting_marker_mid_sentence_still_delivers(self):
         """A genuine report that merely mentions the token mid-sentence must
         be delivered — the old substring check wrongly swallowed it."""
@@ -1998,5 +2023,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

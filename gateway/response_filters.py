@@ -111,6 +111,22 @@ def is_autonomous_silence_response(response: Any) -> bool:
     return False
 
 
+def is_autonomous_silence_contract_violation(response: Any) -> bool:
+    """Return True when an autonomous reply mixes silence with real content.
+
+    The loose autonomous matcher remains available for compatibility with
+    lanes that historically suppressed an edge marker plus an explanation.
+    Cron uses this stricter classification before delivery so a response that
+    violates the documented exact-marker contract cannot be recorded as a
+    successful silent run.
+    """
+
+    return (
+        is_autonomous_silence_response(response)
+        and not is_intentional_silence_response(response)
+    )
+
+
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
     """Silence markers suppress delivery only for successful agent turns."""
     if not isinstance(agent_result, dict):
