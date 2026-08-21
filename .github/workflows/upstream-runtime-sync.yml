@@ -1,0 +1,156 @@
+name: Sync upstream into cirwel-runtime
+
+on:
+  schedule:
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-runtime-sync
+  cancel-in-progress: false
+
+env:
+  RUNTIME_BRANCH: cirwel-runtime
+  SYNC_BRANCH: automation/upstream-main-into-runtime
+  UPSTREAM_REPOSITORY: NousResearch/hermes-agent
+
+jobs:
+  sync:
+    if: github.repository == 'cirwel/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the accepted runtime
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: cirwel-runtime
+
+      - name: Mirror upstream and maintain the integration PR
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main "${RUNTIME_BRANCH}"
+
+          sync_branch_exists=false
+          if git ls-remote --exit-code --heads origin "${SYNC_BRANCH}" >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            sync_branch_exists=true
+          fi
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          mirror_sha="$(git rev-parse origin/main)"
+          runtime_sha="$(git rev-parse "origin/${RUNTIME_BRANCH}")"
+
+          if ! git merge-base --is-ancestor "${mirror_sha}" "${upstream_sha}"; then
+            echo "::error::Fork main diverged from upstream/main; refusing to rewrite it."
+            exit 1
+          fi
+
+          if [ "${mirror_sha}" != "${upstream_sha}" ]; then
+            git push origin "${upstream_sha}:refs/heads/main"
+            git update-ref refs/remotes/origin/main "${upstream_sha}"
+          fi
+
+          pr_number="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --base "${RUNTIME_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if git merge-base --is-ancestor "${upstream_sha}" "${runtime_sha}"; then
+            if [ -n "${pr_number}" ]; then
+              gh pr close "${pr_number}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --comment "Closing automatically: cirwel-runtime already contains upstream/main at ${upstream_sha}."
+            fi
+            echo "No upstream commits are waiting for runtime review."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          branch_changed=true
+          if [ "${sync_branch_exists}" = true ]; then
+            sync_sha="$(git rev-parse "origin/${SYNC_BRANCH}")"
+            read -r commit parent_one parent_two extra <<EOF
+          $(git rev-list --parents -n 1 "${sync_sha}")
+          EOF
+            if [ -z "${extra:-}" ] \
+              && [ "${parent_one:-}" = "${runtime_sha}" ] \
+              && [ "${parent_two:-}" = "${upstream_sha}" ]; then
+              branch_changed=false
+            fi
+          fi
+
+          if [ "${branch_changed}" = true ]; then
+            git switch --detach "${runtime_sha}"
+            git switch -C "${SYNC_BRANCH}"
+            git merge --no-ff --no-edit "${upstream_sha}"
+
+            if [ "${sync_branch_exists}" = true ]; then
+              git push \
+                --force-with-lease="refs/heads/${SYNC_BRANCH}:origin/${SYNC_BRANCH}" \
+                origin "HEAD:refs/heads/${SYNC_BRANCH}"
+            else
+              git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+            fi
+          fi
+
+          body="$(cat <<EOF
+          This draft PR is maintained by the fork-local upstream sync workflow.
+
+          - Upstream: \`${UPSTREAM_REPOSITORY}@${upstream_sha}\`
+          - Runtime base: \`${GITHUB_REPOSITORY}@${runtime_sha}\`
+          - Integration branch: \`${SYNC_BRANCH}\`
+
+          The workflow never auto-merges. Review the diff and CI results before merging into \`${RUNTIME_BRANCH}\`.
+          EOF
+          )"
+
+          if [ -z "${pr_number}" ]; then
+            response="$(
+              gh api \
+                --method POST \
+                "repos/${GITHUB_REPOSITORY}/pulls" \
+                --raw-field title='chore: sync upstream main into cirwel-runtime' \
+                --raw-field head="${SYNC_BRANCH}" \
+                --raw-field base="${RUNTIME_BRANCH}" \
+                --raw-field body="${body}" \
+                --field draft=true
+            )"
+            pr_number="$(jq -r '.number' <<<"${response}")"
+          else
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              --raw-field body="${body}" \
+              >/dev/null
+          fi
+
+          if [ "${branch_changed}" = true ]; then
+            gh workflow run ci.yaml \
+              --repo "${GITHUB_REPOSITORY}" \
+              --ref "${SYNC_BRANCH}"
+          fi
+
+          pr_url="https://github.com/${GITHUB_REPOSITORY}/pull/${pr_number}"
+          echo "changed=${branch_changed}" >> "${GITHUB_OUTPUT}"
+          echo "pr_url=${pr_url}" >> "${GITHUB_OUTPUT}"
+          printf 'Runtime sync PR: %s\n' "${pr_url}" >> "${GITHUB_STEP_SUMMARY}"
