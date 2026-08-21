@@ -531,7 +531,8 @@ def _cwd_marker(session_id: str) -> str:
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|"
     "HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|"
-    "HERMES_CRON_JOB_ID|HERMES_CRON_EXECUTION_ID)"
+    "HERMES_CRON_JOB_ID|HERMES_CRON_EXECUTION_ID|"
+    "HERMES_BROWSER_CONTROL_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -575,6 +576,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
