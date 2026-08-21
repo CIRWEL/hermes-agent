@@ -109,6 +109,15 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
+# Immutable scheduler identities for the active cron attempt. These are
+# ContextVars rather than process-global environment variables so parallel
+# jobs cannot overwrite each other. The local subprocess bridge exports them
+# from _VAR_MAP when a tool starts a child process.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_EXECUTION_ID: ContextVar = ContextVar(
+    "HERMES_CRON_EXECUTION_ID", default=_UNSET
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -152,6 +161,8 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_CRON_SESSION": _CRON_SESSION,
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
+    "HERMES_CRON_EXECUTION_ID": _CRON_EXECUTION_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -232,6 +243,8 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    cron_job_id: str = "",
+    cron_execution_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -251,6 +264,9 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``cron_job_id`` and ``cron_execution_id`` identify one immutable scheduler
+    attempt. Empty defaults mask stale ambient values for non-cron sessions.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -274,6 +290,8 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
+        _CRON_JOB_ID.set(cron_job_id),
+        _CRON_EXECUTION_ID.set(cron_execution_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -313,6 +331,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CRON_SESSION,
+        _CRON_JOB_ID,
+        _CRON_EXECUTION_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

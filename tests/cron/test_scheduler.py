@@ -1438,19 +1438,28 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
-    def test_silent_with_note_suppresses_delivery(self):
+    def test_silent_with_note_fails_before_substantive_delivery(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("⚠️ Cron 'monitor' failed:")
+        assert "No changes detected" not in delivered
+        assert mark_mock.call_args.args[:3] == (
+            "monitor-job",
+            False,
+            "Agent combined a silence marker with substantive content; "
+            "the cron response contract blocked delivery.",
+        )
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_fails_before_substantive_delivery(self):
+        """A report followed by [SILENT] is a failed control-token contract."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
@@ -1460,12 +1469,15 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+        delivered = deliver_mock.call_args.args[1]
+        assert delivered.startswith("⚠️ Cron 'monitor' failed:")
+        assert "2 deals filtered" not in delivered
 
     def test_silent_is_case_insensitive(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):

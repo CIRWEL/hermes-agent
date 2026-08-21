@@ -213,10 +213,48 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
+def test_cron_execution_context_bridges_to_subprocess_env():
+    import contextvars
+
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+        set_session_vars,
+    )
+    from tools.environments.local import _inject_session_context_env
+
+    def exercise():
+        tokens = set_session_vars(
+            cron_session="1",
+            cron_job_id="job-4",
+            cron_execution_id="exec-4",
+        )
+        try:
+            assert get_session_env("HERMES_CRON_JOB_ID") == "job-4"
+            assert get_session_env("HERMES_CRON_EXECUTION_ID") == "exec-4"
+            child_env = {
+                "HERMES_CRON_JOB_ID": "stale-job",
+                "HERMES_CRON_EXECUTION_ID": "stale-execution",
+            }
+            _inject_session_context_env(child_env)
+            assert child_env["HERMES_CRON_JOB_ID"] == "job-4"
+            assert child_env["HERMES_CRON_EXECUTION_ID"] == "exec-4"
+        finally:
+            clear_session_vars(tokens)
+
+    contextvars.copy_context().run(exercise)
+
+
 def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 
     events = []
+    worker_jobs = []
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-3"},
+    )
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
@@ -230,16 +268,17 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
-    )
+    def fake_run_job(job, *, defer_agent_teardown=None, **_kw):
+        worker_jobs.append(dict(job))
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert scheduler.run_one_job({"id": "job-3"}) is True
+    assert worker_jobs[0]["execution_id"] == "exec-3"
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
