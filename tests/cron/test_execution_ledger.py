@@ -232,10 +232,35 @@ def test_claim_acquisition_failure_releases_running_guard(monkeypatch):
     assert "claim-fail" not in scheduler.get_running_job_ids()
 
 
+def test_agent_worker_exports_cron_execution_context(monkeypatch):
+    import os
+
+    from cron.agent_worker import _set_execution_context
+
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", "stale-job")
+    monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "stale-execution")
+
+    _set_execution_context({"id": "job-4", "execution_id": "exec-4"})
+
+    assert os.environ["HERMES_CRON_JOB_ID"] == "job-4"
+    assert os.environ["HERMES_CRON_EXECUTION_ID"] == "exec-4"
+
+    _set_execution_context({"id": "job-5"})
+
+    assert os.environ["HERMES_CRON_JOB_ID"] == "job-5"
+    assert "HERMES_CRON_EXECUTION_ID" not in os.environ
+
+
 def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 
     events = []
+    worker_jobs = []
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-3"},
+    )
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
@@ -249,18 +274,19 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "_run_job_in_killable_process",
-        lambda job, *, verbose=False, **_kw: (True, "output", "response", None),
-    )
+    def fake_run_job(job, *, verbose=False, **_kw):
+        worker_jobs.append(dict(job))
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "_run_job_in_killable_process", fake_run_job)
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "claim_job_for_fire_token", lambda _job_id: "claim-3")
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *a, **k: True)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert scheduler.run_one_job({"id": "job-3"}) is True
+    assert worker_jobs[0]["execution_id"] == "exec-3"
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True

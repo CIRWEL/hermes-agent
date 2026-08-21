@@ -27,6 +27,19 @@ def _read_request() -> dict[str, Any]:
     return payload
 
 
+def _set_execution_context(job: dict[str, Any]) -> None:
+    """Expose the immutable cron episode identity to in-process job tooling."""
+    for env_name, job_key in (
+        ("HERMES_CRON_JOB_ID", "id"),
+        ("HERMES_CRON_EXECUTION_ID", "execution_id"),
+    ):
+        value = str(job.get(job_key) or "").strip()
+        if value:
+            os.environ[env_name] = value
+        else:
+            os.environ.pop(env_name, None)
+
+
 def main() -> int:
     """Run one in-process worker and emit a nonce-bound pipe response."""
     request = _read_request()
@@ -39,6 +52,7 @@ def main() -> int:
     # Parent also sets this before process start; assign explicitly so direct
     # module invocation cannot accidentally bind state to another profile.
     os.environ["HERMES_HOME"] = str(home)
+    _set_execution_context(job)
     _touch_activity_pulse()
 
     from agent.secret_scope import (
