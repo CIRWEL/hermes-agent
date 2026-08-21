@@ -5329,6 +5329,7 @@ def run_one_job(
     )
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    job = dict(job, execution_id=execution_id)
     if not fire_claim_id:
         try:
             fire_claim_id = claim_job_for_fire_token(job["id"])
