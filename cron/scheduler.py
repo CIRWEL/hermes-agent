@@ -337,6 +337,14 @@ def _is_cron_silence_response(text: str) -> bool:
 
     return is_autonomous_silence_response(text)
 
+
+def _is_cron_silence_contract_violation(text: str) -> bool:
+    """Return True when a cron reply mixes a silence marker with content."""
+
+    from gateway.response_filters import is_autonomous_silence_contract_violation
+
+    return is_autonomous_silence_contract_violation(text)
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -4631,7 +4639,10 @@ def run_job(
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
-        _audit_response_silent = _is_cron_silence_response(final_response or "")
+        _audit_response_silent = (
+            _is_cron_silence_response(final_response or "")
+            and not _is_cron_silence_contract_violation(final_response or "")
+        )
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
@@ -5491,6 +5502,17 @@ def run_one_job(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # A silence marker is a control token, not report punctuation. If
+            # the agent mixes it with substantive content, preserve the full
+            # output locally but fail the run before the irreversible send.
+            # Only the compact failure summary below may reach the operator.
+            if success and _is_cron_silence_contract_violation(final_response):
+                success = False
+                error = (
+                    "Agent combined a silence marker with substantive content; "
+                    "the cron response contract blocked delivery."
+                )
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -5534,8 +5556,9 @@ def run_one_job(
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
+            # #46917). Mixed marker/content responses have already been
+            # converted to failed runs above, so only exact markers can reach
+            # this successful-suppression branch.
             if (
                 should_deliver
                 and success
