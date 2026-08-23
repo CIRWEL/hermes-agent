@@ -131,6 +131,53 @@ class TestHandleReasoningCommand(unittest.TestCase):
         self.assertEqual(agent.reasoning_config, {"enabled": True, "effort": "medium"})
         agent.reset_session_state.assert_called_once()
 
+    def test_new_session_honors_per_model_reasoning_override(self):
+        """/new must resolve reasoning through agent.reasoning_overrides, not
+        the raw global.  Reading agent.reasoning_effort directly dropped the
+        per-model override at every session boundary, so a model pinned to an
+        effort its endpoint accepts silently inherited a global one it
+        rejects (xhigh off an OpenAI-family endpoint -> HTTP 400)."""
+        from cli import CLI_CONFIG, HermesCLI
+
+        agent = SimpleNamespace(
+            reasoning_config=None,
+            reset_session_state=MagicMock(),
+            switch_model=MagicMock(),
+        )
+        stub = SimpleNamespace(
+            agent=agent,
+            conversation_history=[],
+            session_id="old-session",
+            _session_db=None,
+            _pending_title=None,
+            _resumed=False,
+            _explicit_model_override=True,
+            reasoning_config=None,
+            _notify_session_boundary=MagicMock(),
+            service_tier=None,
+            _pending_one_turn_model_restore=None,
+            # Already on the config default, so the model-switch branch is a
+            # no-op and only the reasoning resolution is under test.
+            model="pinned-model",
+            provider="openai",
+            requested_provider="openai",
+            api_key="k",
+            base_url="",
+            api_mode="",
+        )
+
+        with patch.dict(
+            CLI_CONFIG.setdefault("agent", {}),
+            {
+                "reasoning_effort": "xhigh",
+                "reasoning_overrides": {"pinned-model": "max"},
+            },
+        ), patch.dict(CLI_CONFIG, {"model": {"default": "pinned-model"}}):
+            HermesCLI.new_session(stub, silent=True)
+
+        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "max"})
+        self.assertEqual(agent.reasoning_config, {"enabled": True, "effort": "max"})
+
     def test_new_session_resets_service_tier_and_model_from_config(self):
         """/new re-derives service tier and model from config.yaml — session
         /fast and /model switches do not carry forward (#48055, #23131)."""
