@@ -9847,9 +9847,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # was for the previous session only, not for every session spawned
         # afterwards.
         self._explicit_model_override = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
+        # Per-model overrides have to win here too.  /new re-derives model and
+        # provider from config.yaml a few lines below, but reasoning was read
+        # straight off the global agent.reasoning_effort, so
+        # agent.reasoning_overrides was silently dropped at every session
+        # boundary -- a model pinned to an effort its endpoint accepts
+        # inherited the global one instead, and a global no provider accepts
+        # (xhigh off an OpenAI-family endpoint) became an HTTP 400 on the next
+        # request.  resolve_reasoning_config() with no model argument derives
+        # it from CLI_CONFIG["model"] using the same default/model precedence
+        # as _config_model below.
+        from hermes_constants import resolve_reasoning_config
+
+        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG)
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
