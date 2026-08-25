@@ -418,6 +418,27 @@ class TestFocusRegainRedraw:
 
         assert calls == ["redraw"]
 
+    def test_focus_regain_redraw_fires_on_freshly_booted_host(self, bare_cli, monkeypatch):
+        """The first repaint must fire even when the clock reads below
+        ``min_interval``.
+
+        ``time.monotonic()`` has an arbitrary origin -- on Linux it counts
+        from boot -- so on a host with low uptime (a fresh CI runner, a
+        just-restarted box) the first focus-in was compared against a 0.0
+        default and suppressed. That is the repaint that matters most, and
+        the failure is invisible on a long-lived dev machine where the
+        monotonic clock is large.
+        """
+        calls = []
+        bare_cli._force_full_redraw = lambda: calls.append("redraw")
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 32.5)
+
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+
+        # First fires despite 32.5 < 60.0; the second is still rate-limited.
+        assert calls == ["redraw"]
+
     def test_focus_regain_redraw_fires_again_after_interval(self, bare_cli):
         calls = []
         bare_cli._force_full_redraw = lambda: calls.append("redraw")

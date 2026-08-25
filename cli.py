@@ -5760,8 +5760,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         per ``min_interval`` seconds.
         """
         now = time.monotonic()
-        last = getattr(self, "_last_focus_regain_redraw", 0.0)
-        if now - last < min_interval:
+        # None, not 0.0, is the "never fired" sentinel.  time.monotonic() has
+        # an arbitrary origin -- on Linux it counts from boot -- so a 0.0
+        # default makes the very first focus-in look like a repaint that
+        # happened at monotonic zero.  On a host whose uptime is still below
+        # min_interval that comparison suppresses the first repaint outright,
+        # which is the one that actually matters after a focus regain.
+        last = getattr(self, "_last_focus_regain_redraw", None)
+        if last is not None and now - last < min_interval:
             return
         self._last_focus_regain_redraw = now
         self._force_full_redraw()
