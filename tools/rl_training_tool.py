@@ -59,6 +59,9 @@ ENVIRONMENTS_DIR = TINKER_ATROPOS_ROOT / "tinker_atropos" / "environments"
 CONFIGS_DIR = TINKER_ATROPOS_ROOT / "configs"
 LOGS_DIR = get_hermes_home() / "logs" / "rl_training"
 
+ENVIRONMENT_BASE_CLASS_NAMES = {"BaseEnv", "HermesAgentBaseEnv"}
+ABSTRACT_ENV_CLASS_NAMES = {"BaseEnv", "HermesAgentBaseEnv"}
+
 def _ensure_logs_dir():
     """Lazily create logs directory on first use (avoid side effects at import time)."""
     if TINKER_ATROPOS_ROOT.exists():
@@ -155,64 +158,116 @@ MIN_STATUS_CHECK_INTERVAL = 30 * 60
 # Environment Discovery
 # ============================================================================
 
+def _environment_search_dirs() -> List[Path]:
+    """Return environment roots to scan, preserving existing constant overrides."""
+    candidates = [
+        Path(ENVIRONMENTS_DIR),
+        Path(HERMES_ROOT) / "environments",
+    ]
+    search_dirs: List[Path] = []
+    seen: set[str] = set()
+    for directory in candidates:
+        try:
+            key = str(directory.resolve())
+        except OSError:
+            key = str(directory)
+        if key in seen or not directory.exists():
+            continue
+        seen.add(key)
+        search_dirs.append(directory)
+    return search_dirs
+
+
+def _iter_environment_files(directory: Path) -> List[Path]:
+    """Return candidate Python environment files below a search root."""
+    return sorted(
+        py_file
+        for py_file in directory.rglob("*.py")
+        if not py_file.name.startswith("_") and py_file.name != "__init__.py"
+    )
+
+
+def _ast_base_name(base: ast.expr) -> str:
+    """Return the simple class name for an AST base expression."""
+    if isinstance(base, ast.Name):
+        return base.id
+    if isinstance(base, ast.Attribute):
+        return base.attr
+    if isinstance(base, ast.Subscript):
+        return _ast_base_name(base.value)
+    return ""
+
+
+def _is_environment_base_name(base_name: str) -> bool:
+    """Return True if a base class name denotes an Atropos environment class."""
+    return base_name in ENVIRONMENT_BASE_CLASS_NAMES or base_name.endswith("Env")
+
+
+def _extract_class_attribute(node: ast.ClassDef, attr_name: str) -> Optional[str]:
+    """Extract a simple string/name class attribute from an AST class node."""
+    for item in node.body:
+        value = None
+        targets: List[ast.expr] = []
+        if isinstance(item, ast.Assign):
+            value = item.value
+            targets = list(item.targets)
+        elif isinstance(item, ast.AnnAssign):
+            value = item.value
+            targets = [item.target]
+
+        if value is None:
+            continue
+
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == attr_name:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    return value.value
+                if isinstance(value, ast.Name):
+                    return value.id
+    return None
+
+
 def _scan_environments() -> List[EnvironmentInfo]:
     """
-    Scan the environments directory for BaseEnv subclasses using AST.
+    Scan upstream Atropos and Hermes environment directories for env classes.
     """
-    environments = []
-    
-    if not ENVIRONMENTS_DIR.exists():
-        return environments
-    
-    for py_file in ENVIRONMENTS_DIR.glob("*.py"):
-        if py_file.name.startswith("_"):
-            continue
-        
-        try:
-            with open(py_file, "r") as f:
-                tree = ast.parse(f.read())
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    # Check if class has BaseEnv as base
-                    for base in node.bases:
-                        base_name = ""
-                        if isinstance(base, ast.Name):
-                            base_name = base.id
-                        elif isinstance(base, ast.Attribute):
-                            base_name = base.attr
-                        
-                        if base_name == "BaseEnv":
-                            # Extract name from class attribute if present
-                            env_name = py_file.stem
-                            description = ""
-                            config_class = "BaseEnvConfig"
-                            
-                            for item in node.body:
-                                if isinstance(item, ast.Assign):
-                                    for target in item.targets:
-                                        if isinstance(target, ast.Name):
-                                            if target.id == "name" and isinstance(item.value, ast.Constant):
-                                                env_name = item.value.value
-                                            elif target.id == "env_config_cls" and isinstance(item.value, ast.Name):
-                                                config_class = item.value.id
-                                
-                                # Get docstring
-                                if isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant):
-                                    if isinstance(item.value.value, str) and not description:
-                                        description = item.value.value.split("\n")[0].strip()
-                            
-                            environments.append(EnvironmentInfo(
-                                name=env_name,
-                                class_name=node.name,
-                                file_path=str(py_file),
-                                description=description or f"Environment from {py_file.name}",
-                                config_class=config_class,
-                            ))
-                            break
-        except Exception as e:
-            logger.warning("Could not parse %s: %s", py_file, e)
-    
+    environments: List[EnvironmentInfo] = []
+    seen: set[tuple[str, str]] = set()
+
+    for env_dir in _environment_search_dirs():
+        for py_file in _iter_environment_files(env_dir):
+            try:
+                with open(py_file, "r") as f:
+                    tree = ast.parse(f.read())
+
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.ClassDef):
+                        continue
+                    if node.name in ABSTRACT_ENV_CLASS_NAMES:
+                        continue
+
+                    base_names = {_ast_base_name(base) for base in node.bases}
+                    if not any(_is_environment_base_name(base_name) for base_name in base_names):
+                        continue
+
+                    env_name = _extract_class_attribute(node, "name") or py_file.stem
+                    config_class = _extract_class_attribute(node, "env_config_cls") or "BaseEnvConfig"
+                    description = ast.get_docstring(node)
+                    key = (env_name, str(py_file))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    environments.append(EnvironmentInfo(
+                        name=env_name,
+                        class_name=node.name,
+                        file_path=str(py_file),
+                        description=(description or f"Environment from {py_file.name}").split("\n")[0].strip(),
+                        config_class=config_class,
+                    ))
+                    break
+            except Exception as e:
+                logger.warning("Could not parse %s: %s", py_file, e)
+
     return environments
 
 
@@ -730,10 +785,13 @@ async def rl_start_training() -> str:
             "error": "No environment selected. Use rl_select_environment(name) first.",
         }, indent=2)
     
-    # Check API keys
-    if not os.getenv("TINKER_API_KEY"):
+    # Check training credentials before writing configs or spawning processes.
+    missing_training_credentials = get_missing_training_keys()
+    if missing_training_credentials:
         return json.dumps({
-            "error": "TINKER_API_KEY not set. Add it to ~/.hermes/.env",
+            "error": "Missing required training credentials",
+            "missing": missing_training_credentials,
+            "message": "Set TINKER_API_KEY and WANDB_API_KEY before starting full training.",
         }, indent=2)
     
     # Find environment file
@@ -1051,11 +1109,15 @@ async def rl_test_inference(
             "error": "No environment selected. Use rl_select_environment(name) first.",
         }, indent=2)
     
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
+    missing_inference_credentials = get_missing_inference_keys()
+    if missing_inference_credentials:
         return json.dumps({
-            "error": "OPENROUTER_API_KEY not set. Required for inference testing.",
+            "error": "Missing required inference credentials",
+            "missing": missing_inference_credentials,
+            "message": "Set OPENROUTER_API_KEY before running non-training inference tests.",
         }, indent=2)
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
     
     # Find environment info
     env_info = None
@@ -1325,34 +1387,65 @@ def check_rl_python_version() -> bool:
     return sys.version_info >= (3, 11)
 
 
+def check_rl_runtime_requirements() -> bool:
+    """Check requirements for read-only RL discovery/configuration tools."""
+    return check_rl_python_version()
+
+
+def check_rl_training_requirements() -> bool:
+    """Check requirements for starting full Tinker/W&B training runs."""
+    return check_rl_python_version() and bool(os.getenv("TINKER_API_KEY")) and bool(os.getenv("WANDB_API_KEY"))
+
+
+def check_rl_inference_requirements() -> bool:
+    """Check requirements for non-training provider inference/process smokes."""
+    return check_rl_python_version() and bool(os.getenv("OPENROUTER_API_KEY"))
+
+
 def check_rl_api_keys() -> bool:
     """
-    Check if required API keys and Python version are available.
-    
-    RL training requires:
-    - Python >= 3.11 (tinker package requirement)
-    - TINKER_API_KEY for the Tinker training API
-    - WANDB_API_KEY for Weights & Biases metrics
+    Backward-compatible alias for full RL training readiness.
+
+    Read-only discovery/config tools intentionally use
+    check_rl_runtime_requirements() so they stay visible without training keys.
     """
-    if not check_rl_python_version():
-        return False
-    tinker_key = os.getenv("TINKER_API_KEY")
-    wandb_key = os.getenv("WANDB_API_KEY")
-    return bool(tinker_key) and bool(wandb_key)
+    return check_rl_training_requirements()
 
 
-def get_missing_keys() -> List[str]:
-    """
-    Get list of missing requirements for RL tools (API keys and Python version).
-    """
+def get_missing_runtime_requirements() -> List[str]:
+    """Get missing requirements shared by every RL operation."""
     missing = []
     if not check_rl_python_version():
         missing.append(f"Python >= 3.11 (current: {sys.version_info.major}.{sys.version_info.minor})")
+    return missing
+
+
+def get_missing_training_keys() -> List[str]:
+    """Get missing requirements for full Tinker/W&B training."""
+    missing = get_missing_runtime_requirements()
     if not os.getenv("TINKER_API_KEY"):
         missing.append("TINKER_API_KEY")
     if not os.getenv("WANDB_API_KEY"):
         missing.append("WANDB_API_KEY")
     return missing
+
+
+def get_missing_inference_keys() -> List[str]:
+    """Get missing requirements for non-training OpenAI-compatible inference tests."""
+    missing = get_missing_runtime_requirements()
+    if not os.getenv("OPENROUTER_API_KEY"):
+        missing.append("OPENROUTER_API_KEY")
+    return missing
+
+
+def get_missing_keys() -> List[str]:
+    """
+    Get missing full-training requirements.
+
+    Kept for rl_cli.py compatibility; read-only RL tool visibility no longer
+    depends on these credentials.
+    """
+    return get_missing_training_keys()
 
 
 # ---------------------------------------------------------------------------
@@ -1371,26 +1464,27 @@ RL_GET_RESULTS_SCHEMA = {"name": "rl_get_results", "description": "Get final res
 RL_LIST_RUNS_SCHEMA = {"name": "rl_list_runs", "description": "List all training runs (active and completed) with their status.", "parameters": {"type": "object", "properties": {}, "required": []}}
 RL_TEST_INFERENCE_SCHEMA = {"name": "rl_test_inference", "description": "Quick inference test for any environment. Runs a few steps of inference + scoring using OpenRouter. Default: 3 steps x 16 completions = 48 rollouts per model, testing 3 models = 144 total. Tests environment loading, prompt construction, inference parsing, and verifier logic. Use BEFORE training to catch issues.", "parameters": {"type": "object", "properties": {"num_steps": {"type": "integer", "description": "Number of steps to run (default: 3, recommended max for testing)", "default": 3}, "group_size": {"type": "integer", "description": "Completions per step (default: 16, like training)", "default": 16}, "models": {"type": "array", "items": {"type": "string"}, "description": "Optional list of OpenRouter model IDs. Default: qwen/qwen3-8b, z-ai/glm-4.7-flash, minimax/minimax-m2.7"}}, "required": []}}
 
-_rl_env = ["TINKER_API_KEY", "WANDB_API_KEY"]
+_rl_training_env = ["TINKER_API_KEY", "WANDB_API_KEY"]
+_rl_inference_env = ["OPENROUTER_API_KEY"]
 
 registry.register(name="rl_list_environments", emoji="🧪", toolset="rl", schema=RL_LIST_ENVIRONMENTS_SCHEMA,
-    handler=lambda args, **kw: rl_list_environments(), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_list_environments(), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_select_environment", emoji="🧪", toolset="rl", schema=RL_SELECT_ENVIRONMENT_SCHEMA,
-    handler=lambda args, **kw: rl_select_environment(name=args.get("name", "")), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_select_environment(name=args.get("name", "")), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_get_current_config", emoji="🧪", toolset="rl", schema=RL_GET_CURRENT_CONFIG_SCHEMA,
-    handler=lambda args, **kw: rl_get_current_config(), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_get_current_config(), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_edit_config", emoji="🧪", toolset="rl", schema=RL_EDIT_CONFIG_SCHEMA,
-    handler=lambda args, **kw: rl_edit_config(field=args.get("field", ""), value=args.get("value")), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_edit_config(field=args.get("field", ""), value=args.get("value")), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_start_training", emoji="🧪", toolset="rl", schema=RL_START_TRAINING_SCHEMA,
-    handler=lambda args, **kw: rl_start_training(), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_start_training(), check_fn=check_rl_training_requirements, requires_env=_rl_training_env, is_async=True)
 registry.register(name="rl_check_status", emoji="🧪", toolset="rl", schema=RL_CHECK_STATUS_SCHEMA,
-    handler=lambda args, **kw: rl_check_status(run_id=args.get("run_id", "")), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_check_status(run_id=args.get("run_id", "")), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_stop_training", emoji="🧪", toolset="rl", schema=RL_STOP_TRAINING_SCHEMA,
-    handler=lambda args, **kw: rl_stop_training(run_id=args.get("run_id", "")), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_stop_training(run_id=args.get("run_id", "")), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_get_results", emoji="🧪", toolset="rl", schema=RL_GET_RESULTS_SCHEMA,
-    handler=lambda args, **kw: rl_get_results(run_id=args.get("run_id", "")), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_get_results(run_id=args.get("run_id", "")), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_list_runs", emoji="🧪", toolset="rl", schema=RL_LIST_RUNS_SCHEMA,
-    handler=lambda args, **kw: rl_list_runs(), check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    handler=lambda args, **kw: rl_list_runs(), check_fn=check_rl_runtime_requirements, requires_env=[], is_async=True)
 registry.register(name="rl_test_inference", emoji="🧪", toolset="rl", schema=RL_TEST_INFERENCE_SCHEMA,
     handler=lambda args, **kw: rl_test_inference(num_steps=args.get("num_steps", 3), group_size=args.get("group_size", 16), models=args.get("models")),
-    check_fn=check_rl_api_keys, requires_env=_rl_env, is_async=True)
+    check_fn=check_rl_inference_requirements, requires_env=_rl_inference_env, is_async=True)

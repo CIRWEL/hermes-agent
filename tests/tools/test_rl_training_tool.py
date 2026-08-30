@@ -5,10 +5,12 @@ terminates processes, and handles edge cases on failure paths.
 Inspired by PR #715 (0xbyt4).
 """
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
 
+import tools.rl_training_tool as rl_tool
 from tools.rl_training_tool import RunState, _stop_training_run
 
 
@@ -140,3 +142,86 @@ class TestStopTrainingRunStatus:
         state = _make_run_state()
         _stop_training_run(state)  # should not raise
         assert state.status == "pending"
+
+
+class TestEnvironmentDiscovery:
+    """Verify RL environment discovery covers both upstream and Hermes env trees."""
+
+    def test_scans_upstream_and_recursive_hermes_environments(self, tmp_path, monkeypatch):
+        """Hermes envs under environments/** should be listed with upstream Atropos envs."""
+        tinker_env_dir = tmp_path / "tinker-atropos" / "tinker_atropos" / "environments"
+        tinker_env_dir.mkdir(parents=True)
+        (tinker_env_dir / "gsm8k_tinker.py").write_text(
+            '''
+class GSM8kEnv(BaseEnv):
+    """Upstream GSM8K environment."""
+    name = "gsm8k"
+''',
+            encoding="utf-8",
+        )
+
+        hermes_env_dir = tmp_path / "environments" / "terminal_test_env"
+        hermes_env_dir.mkdir(parents=True)
+        (hermes_env_dir / "terminal_test_env.py").write_text(
+            '''
+class TerminalTestEnv(HermesAgentBaseEnv):
+    """Hermes terminal smoke environment."""
+    name = "terminal-test"
+''',
+            encoding="utf-8",
+        )
+
+        benchmark_dir = tmp_path / "environments" / "benchmarks" / "tblite"
+        benchmark_dir.mkdir(parents=True)
+        (benchmark_dir / "tblite_env.py").write_text(
+            '''
+class TBLiteEvalEnv(TerminalBench2EvalEnv):
+    """Indirect Hermes benchmark environment."""
+    name = "openthoughts-tblite"
+''',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(rl_tool, "HERMES_ROOT", tmp_path)
+        monkeypatch.setattr(rl_tool, "ENVIRONMENTS_DIR", tinker_env_dir)
+
+        names = {env.name for env in rl_tool._scan_environments()}
+
+        assert "gsm8k" in names
+        assert "terminal-test" in names
+        assert "openthoughts-tblite" in names
+
+
+class TestRLCredentialGating:
+    """Verify read-only RL tools stay visible without training credentials."""
+
+    def test_read_only_tools_are_visible_without_tinker_or_wandb_keys(self, monkeypatch):
+        monkeypatch.delenv("TINKER_API_KEY", raising=False)
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        from model_tools import get_tool_definitions
+
+        tools = get_tool_definitions(enabled_toolsets=["rl"], quiet_mode=True)
+        names = {tool["function"]["name"] for tool in tools}
+
+        assert {
+            "rl_list_environments",
+            "rl_select_environment",
+            "rl_get_current_config",
+            "rl_edit_config",
+            "rl_list_runs",
+        }.issubset(names)
+        assert "rl_start_training" not in names
+        assert "rl_test_inference" not in names
+
+    @pytest.mark.asyncio
+    async def test_start_training_reports_all_missing_training_keys(self, monkeypatch):
+        monkeypatch.delenv("TINKER_API_KEY", raising=False)
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+        monkeypatch.setattr(rl_tool, "_current_env", "terminal-test")
+
+        result = json.loads(await rl_tool.rl_start_training())
+
+        assert result["error"] == "Missing required training credentials"
+        assert result["missing"] == ["TINKER_API_KEY", "WANDB_API_KEY"]
